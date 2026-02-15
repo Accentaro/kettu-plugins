@@ -16,7 +16,6 @@
     const uiToasts = vendetta.ui.toasts;
     const alerts = vendetta.ui.alerts;
     const metro = vendetta.metro;
-    const findInReactTree = vendetta.utils.findInReactTree;
     const common = vendetta.metro.common;
     const React = common.React;
     const ReactNative = common.ReactNative;
@@ -229,7 +228,13 @@
     }
 
     function getButtonMessage(button) {
-        return String(button?.props?.message ?? button?.props?.label ?? "");
+        return String(
+            button?.props?.message
+            ?? button?.props?.label
+            ?? button?.props?.title
+            ?? button?.props?.text
+            ?? "",
+        );
     }
 
     function hasQuoteButton(buttons) {
@@ -252,6 +257,75 @@
         return Math.min(4, buttons.length);
     }
 
+    function isActionRowElement(element) {
+        if (!element || typeof element !== "object" || !element.type || !element.props) {
+            return false;
+        }
+
+        const props = element.props;
+        return typeof props.onPress === "function"
+            || typeof props.action === "function";
+    }
+
+    function findBestRowArray(root) {
+        const knownLabels = new Set([
+            "Edit Message",
+            "Reply",
+            "Forward",
+            "Create Thread",
+            "Copy Text",
+            "Mark Unread",
+            "Pin Message",
+            "Apps",
+            "Mention",
+            "Copy Message Link",
+            "Copy Message ID",
+            "Delete Message",
+        ]);
+
+        const stack = [root];
+        const seen = new Set();
+        let best = null;
+        let bestScore = -1;
+
+        while (stack.length) {
+            const current = stack.pop();
+            if (!current || typeof current !== "object") continue;
+            if (seen.has(current)) continue;
+            seen.add(current);
+
+            if (Array.isArray(current)) {
+                const rows = current.filter(isActionRowElement);
+                if (rows.length >= 3) {
+                    let score = rows.length;
+                    for (const row of rows) {
+                        if (knownLabels.has(getButtonMessage(row))) {
+                            score += 10;
+                        }
+                    }
+
+                    if (score > bestScore) {
+                        bestScore = score;
+                        best = current;
+                    }
+                }
+
+                for (const item of current) {
+                    if (item && typeof item === "object") stack.push(item);
+                }
+                continue;
+            }
+
+            for (const value of Object.values(current)) {
+                if (value && typeof value === "object") {
+                    stack.push(value);
+                }
+            }
+        }
+
+        return best;
+    }
+
     function createQuoteButton(templateButton, message) {
         if (!templateButton?.type) return null;
 
@@ -270,6 +344,8 @@
             key: "kettu-quoter-button",
             message: "Quote",
             label: "Quote",
+            title: "Quote",
+            text: "Quote",
             icon: fallbackIcon ?? templateButton?.props?.icon,
             variant: undefined,
             isDestructive: false,
@@ -281,17 +357,13 @@
     }
 
     function injectQuoteIntoMessageSheet(sheetTree, message) {
-        const buttons = findInReactTree(
-            sheetTree,
-            node =>
-                Array.isArray(node)
-                && node.length > 0
-                && node.some(item => item?.type?.name === "ButtonRow"),
-        );
+        const buttons = findBestRowArray(sheetTree);
 
         if (!buttons || hasQuoteButton(buttons)) return;
 
         const template = buttons.find(button => button?.type?.name === "ButtonRow")
+            ?? buttons.find(button => button?.type?.name === "ActionSheetRow")
+            ?? buttons.find(button => button?.type?.name === "TableRow")
             ?? buttons.find(Boolean);
         const quoteButton = createQuoteButton(template, message);
         if (!quoteButton) return;
