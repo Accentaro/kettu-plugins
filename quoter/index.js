@@ -949,45 +949,54 @@ render().catch(error => {
 
     function dataUrlToBlob(dataUrl) {
         const parsed = parseDataUrl(dataUrl);
-        if (!parsed || typeof Blob !== "function") return null;
+        if (!parsed) return Promise.resolve(null);
 
-        const { body, isBase64, mime } = parsed;
+        const tryFetchBlob = () => {
+            if (typeof fetch !== "function") return Promise.resolve(null);
+            return Promise.resolve(fetch(parsed.normalized)).then(response => {
+                if (!response || response.ok === false) return null;
 
-        try {
-            if (isBase64) {
-                if (typeof atob === "function") {
-                    const binary = atob(body);
-                    const bytes = new Uint8Array(binary.length);
-                    for (let i = 0; i < binary.length; i++) {
-                        bytes[i] = binary.charCodeAt(i);
+                if (typeof response.blob === "function") {
+                    return Promise.resolve(response.blob()).catch(() => null);
+                }
+
+                if (typeof response.arrayBuffer === "function" && typeof Blob === "function") {
+                    return Promise.resolve(response.arrayBuffer())
+                        .then(buffer => new Blob([buffer], { type: parsed.mime }))
+                        .catch(() => null);
+                }
+
+                return null;
+            }).catch(() => null);
+        };
+
+        const tryDecodeBlob = () => {
+            if (typeof Blob !== "function") return null;
+
+            const { body, isBase64, mime } = parsed;
+            try {
+                if (isBase64) {
+                    if (typeof atob === "function") {
+                        const binary = atob(body);
+                        const bytes = new Uint8Array(binary.length);
+                        for (let i = 0; i < binary.length; i++) {
+                            bytes[i] = binary.charCodeAt(i);
+                        }
+                        return new Blob([bytes], { type: mime });
                     }
+
+                    const bytes = decodeBase64ToBytes(body);
                     return new Blob([bytes], { type: mime });
                 }
 
-                const bytes = decodeBase64ToBytes(body);
-                return new Blob([bytes], { type: mime });
+                const text = decodeURIComponent(body);
+                return new Blob([text], { type: mime });
+            } catch {
+                return null;
             }
-
-            const text = decodeURIComponent(body);
-            return new Blob([text], { type: mime });
-        } catch {
-            return null;
-        }
-    }
-
-    function dataUrlToUploadObject(dataUrl, fileName) {
-        const parsed = parseDataUrl(dataUrl);
-        if (!parsed) return null;
-
-        return {
-            uri: parsed.normalized,
-            path: parsed.normalized,
-            name: fileName,
-            fileName,
-            filename: fileName,
-            mimeType: parsed.mime,
-            type: parsed.mime,
         };
+
+        return tryFetchBlob().then(blob => blob ?? tryDecodeBlob());
     }
 
     function resolveChannel(channelId) {
@@ -1136,77 +1145,73 @@ render().catch(error => {
         if (!channel) return Promise.reject(new Error("Unable to resolve channel object."));
 
         const fileName = buildFileName(message);
-        const blob = dataUrlToBlob(dataUrl);
-        const uploadable = blob
-            ? (typeof File === "function"
-                ? new File([blob], fileName, { type: "image/png" })
+        return Promise.resolve(dataUrlToBlob(dataUrl)).then(blob => {
+            if (!blob) throw new Error("Invalid rendered quote image.");
+
+            const mimeType = typeof blob.type === "string" && blob.type ? blob.type : "image/png";
+            const uploadable = typeof File === "function"
+                ? new File([blob], fileName, { type: mimeType })
                 : Object.assign(blob, {
                     name: fileName,
                     fileName,
                     filename: fileName,
-                    mimeType: "image/png",
-                    type: "image/png",
-                }))
-            : dataUrlToUploadObject(dataUrl, fileName);
-        if (!uploadable) {
-            return Promise.reject(new Error("Invalid rendered quote image."));
-        }
-        if (!blob) {
-            logDebug("Using URI upload object fallback", fileName);
-        }
+                    mimeType,
+                    type: mimeType,
+                });
 
-        const draftType = getChannelMessageDraftType();
-        const rankedCandidates = uploadCandidates.slice(0, 90);
-        logDebug("Send quote using upload candidates", rankedCandidates.map(c => `${c.key}@${c.source}[${c.score}]`).join(", "));
+            const draftType = getChannelMessageDraftType();
+            const rankedCandidates = uploadCandidates.slice(0, 90);
+            logDebug("Send quote using upload candidates", rankedCandidates.map(c => `${c.key}@${c.source}[${c.score}]`).join(", "));
 
-        return new Promise((resolve, reject) => {
-            let index = 0;
-            let lastError = null;
-            const shortErrors = [];
+            return new Promise((resolve, reject) => {
+                let index = 0;
+                let lastError = null;
+                const shortErrors = [];
 
-            const run = () => {
-                if (index >= rankedCandidates.length) {
-                    const fallbackError = lastError instanceof Error
-                        ? lastError
-                        : new Error("Upload handler invocation failed for all candidates.");
-                    logError(`Upload failed after ${rankedCandidates.length} candidates`, fallbackError);
-                    const details = shortErrors.length ? ` last=${shortErrors.join(" | ")}` : "";
-                    cachedUploadCandidates = null;
-                    tryUploadViaUploadManager(uploadable, channel, channelId, draftType, fileName).then(() => {
-                        logDebug("Upload fallback succeeded", "UploadManager.addFile + sendMessage");
-                        resolve();
-                    }).catch(uploadManagerError => {
-                        const managerMsg = uploadManagerError instanceof Error ? uploadManagerError.message : String(uploadManagerError);
-                        reject(new Error(`${fallbackError.message}.${details} uploadManager=${managerMsg} ${lastUploadLookupDiagnostics}`));
-                    });
-                    return;
-                }
-
-                const candidate = rankedCandidates[index++];
-                invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType, fileName).then(() => {
-                    const uploadEntryExists = hasUploadForFile(channelId, fileName, draftType);
-                    if (uploadEntryExists && !isLikelyPrimaryUploaderCandidate(candidate)) {
-                        trySendDraftWithAttachment(channelId).then(() => {
-                            logDebug("Upload candidate succeeded", `${candidate.key}@${candidate.source}[${candidate.score}] + sendMessage`);
+                const run = () => {
+                    if (index >= rankedCandidates.length) {
+                        const fallbackError = lastError instanceof Error
+                            ? lastError
+                            : new Error("Upload handler invocation failed for all candidates.");
+                        logError(`Upload failed after ${rankedCandidates.length} candidates`, fallbackError);
+                        const details = shortErrors.length ? ` last=${shortErrors.join(" | ")}` : "";
+                        cachedUploadCandidates = null;
+                        tryUploadViaUploadManager(uploadable, channel, channelId, draftType, fileName).then(() => {
+                            logDebug("Upload fallback succeeded", "UploadManager.addFile + sendMessage");
                             resolve();
-                        }).catch(error => {
-                            lastError = error;
-                            run();
+                        }).catch(uploadManagerError => {
+                            const managerMsg = uploadManagerError instanceof Error ? uploadManagerError.message : String(uploadManagerError);
+                            reject(new Error(`${fallbackError.message}.${details} uploadManager=${managerMsg} ${lastUploadLookupDiagnostics}`));
                         });
                         return;
                     }
 
-                    logDebug("Upload candidate succeeded", `${candidate.key}@${candidate.source}[${candidate.score}]`);
-                    resolve();
-                }).catch(error => {
-                    lastError = error;
-                    const msg = error instanceof Error ? error.message : String(error);
-                    if (shortErrors.length < 5) shortErrors.push(`${candidate.key}:${msg}`);
-                    run();
-                });
-            };
+                    const candidate = rankedCandidates[index++];
+                    invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType, fileName).then(() => {
+                        const uploadEntryExists = hasUploadForFile(channelId, fileName, draftType);
+                        if (uploadEntryExists && !isLikelyPrimaryUploaderCandidate(candidate)) {
+                            trySendDraftWithAttachment(channelId).then(() => {
+                                logDebug("Upload candidate succeeded", `${candidate.key}@${candidate.source}[${candidate.score}] + sendMessage`);
+                                resolve();
+                            }).catch(error => {
+                                lastError = error;
+                                run();
+                            });
+                            return;
+                        }
 
-            run();
+                        logDebug("Upload candidate succeeded", `${candidate.key}@${candidate.source}[${candidate.score}]`);
+                        resolve();
+                    }).catch(error => {
+                        lastError = error;
+                        const msg = error instanceof Error ? error.message : String(error);
+                        if (shortErrors.length < 5) shortErrors.push(`${candidate.key}:${msg}`);
+                        run();
+                    });
+                };
+
+                run();
+            });
         });
     }
 
