@@ -400,41 +400,94 @@ render().catch(error => {
     function functionContainsUploadSignature(fn) {
         if (typeof fn !== "function") return false;
         try {
-            return String(fn).includes("Unexpected mismatch between files and file metadata");
+            const source = String(fn);
+            return source.includes("Unexpected mismatch between files and file metadata")
+                || source.includes("=!0,showLargeMessageDialog:")
+                || source.includes("showLargeMessageDialog");
         } catch {
             return false;
         }
+    }
+
+    function getPromptCandidateFromObject(root) {
+        if (!root || (typeof root !== "object" && typeof root !== "function")) return null;
+
+        const directNames = [
+            "promptToUpload",
+            "showUploadDialog",
+            "uploadFiles",
+            "handleUpload",
+        ];
+        for (const name of directNames) {
+            try {
+                const fn = root?.[name];
+                if (typeof fn === "function") return { fn, ctx: root };
+            } catch { }
+        }
+
+        const queue = [{ value: root, depth: 0 }];
+        const seen = new Set();
+        while (queue.length) {
+            const { value, depth } = queue.shift();
+            if (!value || (typeof value !== "object" && typeof value !== "function")) continue;
+            if (seen.has(value)) continue;
+            seen.add(value);
+
+            let entries = [];
+            try {
+                entries = Object.entries(value);
+            } catch { }
+
+            for (const [key, child] of entries.slice(0, 120)) {
+                if (typeof child === "function") {
+                    if (key === "promptToUpload" || functionContainsUploadSignature(child)) {
+                        return { fn: child, ctx: value };
+                    }
+                } else if (child && typeof child === "object" && depth < 2) {
+                    queue.push({ value: child, depth: depth + 1 });
+                }
+            }
+        }
+
+        return null;
     }
 
     function getUploadPromptToUpload() {
         if (typeof cachedPromptToUpload === "function") return cachedPromptToUpload;
 
         const uploadModule = getUploadModule();
-        if (uploadModule && typeof uploadModule.promptToUpload === "function") {
-            cachedPromptToUpload = uploadModule.promptToUpload;
+        const fromUploadModule = getPromptCandidateFromObject(uploadModule);
+        if (fromUploadModule?.fn) {
+            cachedPromptToUpload = (...args) => fromUploadModule.fn.apply(fromUploadModule.ctx, args);
             return cachedPromptToUpload;
         }
 
-        const directFunction = safeFind(() =>
-            metro.find(candidate => functionContainsUploadSignature(candidate)),
-        );
-        if (typeof directFunction === "function") {
-            cachedPromptToUpload = directFunction;
+        const largeMessageModule = safeFind(() => metro.findByProps("showLargeMessageDialog"));
+        const fromLargeMessageModule = getPromptCandidateFromObject(largeMessageModule);
+        if (fromLargeMessageModule?.fn) {
+            cachedPromptToUpload = (...args) => fromLargeMessageModule.fn.apply(fromLargeMessageModule.ctx, args);
             return cachedPromptToUpload;
         }
 
-        const holder = safeFind(() =>
+        const broadModule = safeFind(() =>
             metro.find(candidate => {
-                if (!candidate || typeof candidate !== "object") return false;
-                return Object.values(candidate).some(functionContainsUploadSignature);
+                if (!candidate) return false;
+                if (typeof candidate === "function") return functionContainsUploadSignature(candidate);
+                if (typeof candidate !== "object") return false;
+
+                try {
+                    return Object.values(candidate).some(value =>
+                        typeof value === "function" && functionContainsUploadSignature(value),
+                    );
+                } catch {
+                    return false;
+                }
             }),
         );
-        if (holder && typeof holder === "object") {
-            const fn = Object.values(holder).find(functionContainsUploadSignature);
-            if (typeof fn === "function") {
-                cachedPromptToUpload = fn;
-                return cachedPromptToUpload;
-            }
+        const fromBroadModule = getPromptCandidateFromObject(broadModule);
+        if (fromBroadModule?.fn) {
+            cachedPromptToUpload = (...args) => fromBroadModule.fn.apply(fromBroadModule.ctx, args);
+            return cachedPromptToUpload;
         }
 
         return null;
@@ -522,7 +575,30 @@ render().catch(error => {
             });
 
         const draftType = getChannelMessageDraftType();
-        return Promise.resolve(promptToUpload([uploadable], channel, draftType));
+        const attempts = [
+            () => promptToUpload([uploadable], channel, draftType),
+            () => promptToUpload([uploadable], channel),
+            () => promptToUpload(channel, [uploadable], draftType),
+            () => promptToUpload({
+                channel,
+                files: [uploadable],
+                uploads: [uploadable],
+                draftType,
+            }),
+        ];
+
+        let lastError = null;
+        for (const attempt of attempts) {
+            try {
+                return Promise.resolve(attempt());
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        return Promise.reject(lastError instanceof Error
+            ? lastError
+            : new Error("Upload handler invocation failed on this build."));
     }
 
     function QuotePreviewCard({ message, onStateChange }) {
