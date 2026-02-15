@@ -51,6 +51,15 @@
         try {
             const parsed = new URL(url);
             parsed.searchParams.set("size", "512");
+
+            const isDiscordCdn = parsed.hostname === "cdn.discordapp.com"
+                || parsed.hostname === "media.discordapp.net";
+            if (isDiscordCdn) {
+                // Popcat quote endpoint is picky with avatar formats; enforce static PNG.
+                parsed.pathname = parsed.pathname.replace(/\.(webp|gif|jpg|jpeg)$/i, ".png");
+                parsed.searchParams.set("format", "png");
+            }
+
             return parsed.toString();
         } catch {
             return url;
@@ -83,9 +92,7 @@
         const avatarHash = getAuthorAvatarHash(author);
 
         if (authorId && avatarHash) {
-            const animated = String(avatarHash).startsWith("a_");
-            const ext = animated ? "gif" : "png";
-            return `https://cdn.discordapp.com/avatars/${authorId}/${avatarHash}.${ext}?size=512`;
+            return `https://cdn.discordapp.com/avatars/${authorId}/${avatarHash}.png?size=512`;
         }
 
         return "https://cdn.discordapp.com/embed/avatars/0.png?size=512";
@@ -94,7 +101,7 @@
     function getAuthorAvatarUrl(author) {
         try {
             if (avatarUtils && typeof avatarUtils.getUserAvatarURL === "function") {
-                const avatarFromModule = avatarUtils.getUserAvatarURL(author, true);
+                const avatarFromModule = avatarUtils.getUserAvatarURL(author, false);
                 if (typeof avatarFromModule === "string" && avatarFromModule.length > 0) {
                     return upgradeAvatarUrl(avatarFromModule);
                 }
