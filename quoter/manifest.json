@@ -1,0 +1,14 @@
+{
+    "name": "Quoter",
+    "description": "Adds a Quote action to message menus and generates a quote image URL from the selected message.",
+    "authors": [
+        {
+            "name": "newar"
+        }
+    ],
+    "main": "index.js",
+    "hash": "a47d2dc488726796f273461a939ce1a8e59221ddfbcd59cfce8f23e026abcd40",
+    "vendetta": {
+        "icon": "ChatXIcon"
+    }
+}

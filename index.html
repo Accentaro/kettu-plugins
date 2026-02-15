@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kettu Plugins</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #12161f;
+            --panel: #1c2230;
+            --text: #e9eefc;
+            --muted: #93a3c7;
+            --accent: #48a8ff;
+        }
+
+        body {
+            margin: 0;
+            font-family: "Segoe UI", Tahoma, sans-serif;
+            background: radial-gradient(circle at top right, #28324d 0%, var(--bg) 45%);
+            color: var(--text);
+        }
+
+        main {
+            max-width: 760px;
+            margin: 48px auto;
+            padding: 0 20px;
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: 2rem;
+        }
+
+        p {
+            margin: 0 0 24px;
+            color: var(--muted);
+        }
+
+        .card {
+            background: var(--panel);
+            border: 1px solid #2e3b59;
+            border-radius: 14px;
+            padding: 18px;
+            margin-bottom: 12px;
+        }
+
+        .plugin {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .plugin-name {
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+
+        a {
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+<main>
+    <h1>Kettu Plugins</h1>
+    <p>Paste plugin links below into Kettu's plugin installer.</p>
+
+    <div class="card plugin">
+        <div>
+            <div class="plugin-name">Quoter</div>
+            <div>Message context-menu quote URL generator</div>
+        </div>
+        <a href="./quoter/">Open</a>
+    </div>
+</main>
+</body>
+</html>
