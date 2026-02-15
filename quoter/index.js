@@ -16,12 +16,12 @@
     const uiToasts = vendetta.ui.toasts;
     const alerts = vendetta.ui.alerts;
     const metro = vendetta.metro;
+    const findInReactTree = vendetta.utils.findInReactTree;
     const common = vendetta.metro.common;
     const React = common.React;
     const ReactNative = common.ReactNative;
 
-    const actionSheetModule = metro.findByProps("showSimpleActionSheet");
-    const contextMenuModule = metro.findByProps("ContextMenu", "hideContextMenu");
+    const actionSheetModule = metro.findByProps("openLazy", "hideActionSheet");
     const messageUtil = common.messageUtil;
     const clipboard = common.clipboard;
 
@@ -190,53 +190,6 @@
         return null;
     }
 
-    function createQuoteActionItem(message) {
-        return {
-            id: "kettu-quoter",
-            label: "Quote",
-            action: () => handleQuoteAction(message),
-            onPress: () => handleQuoteAction(message),
-        };
-    }
-
-    function hasQuoteOption(items) {
-        return items.some(
-            item => item?.id === "kettu-quoter" || item?.label === "Quote",
-        );
-    }
-
-    function injectIntoList(list, message) {
-        if (!Array.isArray(list)) return false;
-        if (hasQuoteOption(list)) return false;
-
-        list.push(createQuoteActionItem(message));
-        return true;
-    }
-
-    function injectIntoNestedList(list, message) {
-        if (!Array.isArray(list)) return false;
-
-        if (list.length > 0 && Array.isArray(list[0])) {
-            const firstGroup = list[0];
-            if (!Array.isArray(firstGroup)) return false;
-            if (hasQuoteOption(firstGroup)) return false;
-            firstGroup.push(createQuoteActionItem(message));
-            return true;
-        }
-
-        return injectIntoList(list, message);
-    }
-
-    function injectQuoteAction(target, message) {
-        if (!target || typeof target !== "object") return false;
-
-        if (injectIntoNestedList(target.options, message)) return true;
-        if (injectIntoNestedList(target.items, message)) return true;
-        if (injectIntoNestedList(target.rows, message)) return true;
-
-        return false;
-    }
-
     function handleQuoteAction(message) {
         const quoteUrl = getQuoteUrl(message);
 
@@ -267,45 +220,123 @@
         });
     }
 
+    function isMessageLongPressSheetKey(key) {
+        return typeof key === "string"
+            && (
+                key === "MessageLongPressActionSheet"
+                || key.includes("MessageLongPress")
+            );
+    }
+
+    function getButtonMessage(button) {
+        return String(button?.props?.message ?? button?.props?.label ?? "");
+    }
+
+    function hasQuoteButton(buttons) {
+        return buttons.some(button => getButtonMessage(button) === "Quote");
+    }
+
+    function getInsertIndex(buttons) {
+        const targets = [
+            "Mark Unread",
+            "Copy Text",
+            "Apps",
+            "Mention",
+        ];
+
+        for (const target of targets) {
+            const index = buttons.findIndex(button => getButtonMessage(button) === target);
+            if (index >= 0) return index;
+        }
+
+        return Math.min(4, buttons.length);
+    }
+
+    function createQuoteButton(templateButton, message) {
+        if (!templateButton?.type) return null;
+
+        const onPress = () => {
+            try {
+                actionSheetModule?.hideActionSheet?.();
+            } catch { }
+
+            setTimeout(() => handleQuoteAction(message), 0);
+        };
+
+        const fallbackIcon = assets.getAssetIDByName("LinkIcon");
+
+        const props = {
+            ...templateButton.props,
+            key: "kettu-quoter-button",
+            message: "Quote",
+            label: "Quote",
+            icon: fallbackIcon ?? templateButton?.props?.icon,
+            variant: undefined,
+            isDestructive: false,
+            onPress,
+            action: onPress,
+        };
+
+        return React.createElement(templateButton.type, props);
+    }
+
+    function injectQuoteIntoMessageSheet(sheetTree, message) {
+        const buttons = findInReactTree(
+            sheetTree,
+            node =>
+                Array.isArray(node)
+                && node.length > 0
+                && node.some(item => item?.type?.name === "ButtonRow"),
+        );
+
+        if (!buttons || hasQuoteButton(buttons)) return;
+
+        const template = buttons.find(button => button?.type?.name === "ButtonRow")
+            ?? buttons.find(Boolean);
+        const quoteButton = createQuoteButton(template, message);
+        if (!quoteButton) return;
+
+        const at = getInsertIndex(buttons);
+        buttons.splice(at, 0, quoteButton);
+    }
+
     function patchMessageContextMenu() {
-        if (actionSheetModule && typeof actionSheetModule.showSimpleActionSheet === "function") {
-            const unpatchActionSheet = vendetta.patcher.after(
-                "showSimpleActionSheet",
+        if (actionSheetModule && typeof actionSheetModule.openLazy === "function") {
+            const unpatchActionSheet = vendetta.patcher.before(
+                "openLazy",
                 actionSheetModule,
                 args => {
-                    const config = args?.[0];
-                    if (!config || typeof config !== "object") return;
+                    const lazyComponent = args?.[0];
+                    const key = args?.[1];
+                    const payload = args?.[2];
+                    if (!isMessageLongPressSheetKey(key)) return;
 
-                    const message = extractMessage(config);
+                    const message = extractMessage(payload);
                     if (!message || !normalizeText(message.content)) return;
 
-                    injectQuoteAction(config, message);
+                    Promise.resolve(lazyComponent).then(module => {
+                        if (!module || typeof module.default !== "function") return;
+
+                        const unpatchModalRender = vendetta.patcher.after(
+                            "default",
+                            module,
+                            (_, sheetTree) => {
+                                React.useEffect(
+                                    () => () => unpatchModalRender(),
+                                    [],
+                                );
+
+                                injectQuoteIntoMessageSheet(sheetTree, message);
+                                return sheetTree;
+                            },
+                        );
+                    }).catch(() => { });
                 },
             );
 
             patches.push(unpatchActionSheet);
         } else {
-            vendetta.logger.warn(`[${MODULE_TAG}] showSimpleActionSheet module not found.`);
-        }
-
-        if (contextMenuModule && typeof contextMenuModule.ContextMenu === "function") {
-            const unpatchContextMenu = vendetta.patcher.before(
-                "ContextMenu",
-                contextMenuModule,
-                args => {
-                    const props = args?.[0];
-                    if (!props || typeof props !== "object") return;
-
-                    const message = extractMessage(props);
-                    if (!message || !normalizeText(message.content)) return;
-
-                    injectQuoteAction(props, message);
-                },
-            );
-
-            patches.push(unpatchContextMenu);
-        } else {
-            vendetta.logger.warn(`[${MODULE_TAG}] ContextMenu module not found.`);
+            vendetta.logger.warn(`[${MODULE_TAG}] openLazy action sheet module not found.`);
         }
     }
 
