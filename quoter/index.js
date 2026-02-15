@@ -1,6 +1,6 @@
 (() => {
     const MODULE_TAG = "KettuQuoter";
-    const BUILD_ID = "2026-02-15-r3";
+    const BUILD_ID = "2026-02-15";
 
     const DEFAULTS = {
         grayscale: true,
@@ -903,15 +903,49 @@ render().catch(error => {
         return Number.isFinite(value) ? value : 0;
     }
 
+    function normalizeBase64Payload(base64) {
+        let normalized = String(base64 || "").trim();
+        if (!normalized) return "";
+
+        if (normalized.includes("%")) {
+            try {
+                normalized = decodeURIComponent(normalized);
+            } catch { }
+        }
+
+        normalized = normalized
+            .replace(/\s+/g, "")
+            .replace(/-/g, "+")
+            .replace(/_/g, "/");
+
+        const pad = normalized.length % 4;
+        if (pad === 2) normalized += "==";
+        else if (pad === 3) normalized += "=";
+        else if (pad === 1) normalized = normalized.slice(0, normalized.length - 1);
+
+        return normalized;
+    }
+
     function decodeBase64ToBytes(base64) {
+        const normalized = normalizeBase64Payload(base64);
+        if (!normalized) return new Uint8Array();
+
+        if (typeof atob === "function") {
+            try {
+                const binary = atob(normalized);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                return bytes;
+            } catch { }
+        }
+
         const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        const clean = String(base64 || "").replace(/[^A-Za-z0-9+/=]/g, "");
         const out = [];
         let buffer = 0;
         let bits = 0;
 
-        for (let i = 0; i < clean.length; i++) {
-            const ch = clean[i];
+        for (let i = 0; i < normalized.length; i++) {
+            const ch = normalized[i];
             if (ch === "=") break;
             const value = alphabet.indexOf(ch);
             if (value < 0) continue;
@@ -926,6 +960,50 @@ render().catch(error => {
         }
 
         return new Uint8Array(out);
+    }
+
+    function encodeBytesToBase64(bytes) {
+        if (!bytes || !bytes.length) return "";
+
+        if (typeof btoa === "function") {
+            try {
+                let binary = "";
+                const chunkSize = 0x8000;
+                for (let i = 0; i < bytes.length; i += chunkSize) {
+                    const chunk = bytes.subarray(i, i + chunkSize);
+                    binary += String.fromCharCode.apply(null, Array.from(chunk));
+                }
+                return btoa(binary);
+            } catch { }
+        }
+
+        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let output = "";
+        let i = 0;
+
+        for (; i + 2 < bytes.length; i += 3) {
+            const n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+            output += alphabet[(n >> 18) & 63];
+            output += alphabet[(n >> 12) & 63];
+            output += alphabet[(n >> 6) & 63];
+            output += alphabet[n & 63];
+        }
+
+        const remaining = bytes.length - i;
+        if (remaining === 1) {
+            const n = bytes[i] << 16;
+            output += alphabet[(n >> 18) & 63];
+            output += alphabet[(n >> 12) & 63];
+            output += "==";
+        } else if (remaining === 2) {
+            const n = (bytes[i] << 16) | (bytes[i + 1] << 8);
+            output += alphabet[(n >> 18) & 63];
+            output += alphabet[(n >> 12) & 63];
+            output += alphabet[(n >> 6) & 63];
+            output += "=";
+        }
+
+        return output;
     }
 
     function parseDataUrl(dataUrl) {
@@ -947,56 +1025,86 @@ render().catch(error => {
         };
     }
 
-    function dataUrlToBlob(dataUrl) {
+    function bytesToUploadable(bytes, mimeType, fileName) {
+        if (!bytes || !bytes.length) return null;
+
+        const mime = String(mimeType || "image/png");
+        if (typeof File === "function") {
+            return new File([bytes], fileName, { type: mime });
+        }
+
+        if (typeof Blob === "function") {
+            const blob = new Blob([bytes], { type: mime });
+            return Object.assign(blob, {
+                name: fileName,
+                fileName,
+                filename: fileName,
+                mimeType: mime,
+                type: mime,
+            });
+        }
+
+        const base64 = encodeBytesToBase64(bytes);
+        if (!base64) return null;
+
+        return {
+            uri: `data:${mime};base64,${base64}`,
+            name: fileName,
+            fileName,
+            filename: fileName,
+            mimeType: mime,
+            type: mime,
+        };
+    }
+
+    function dataUrlToUploadable(dataUrl, fileName) {
         const parsed = parseDataUrl(dataUrl);
         if (!parsed) return Promise.resolve(null);
 
-        const tryFetchBlob = () => {
+        const tryDecode = () => {
+            let bytes = null;
+            if (parsed.isBase64) {
+                const decoded = decodeBase64ToBytes(parsed.body);
+                if (decoded && decoded.length) bytes = decoded;
+            } else {
+                try {
+                    const text = decodeURIComponent(parsed.body);
+                    if (typeof TextEncoder === "function") {
+                        bytes = new TextEncoder().encode(text);
+                    } else {
+                        const arr = new Uint8Array(text.length);
+                        for (let i = 0; i < text.length; i++) arr[i] = text.charCodeAt(i) & 0xff;
+                        bytes = arr;
+                    }
+                } catch { }
+            }
+
+            return bytesToUploadable(bytes, parsed.mime, fileName);
+        };
+
+        const tryFetch = () => {
             if (typeof fetch !== "function") return Promise.resolve(null);
             return Promise.resolve(fetch(parsed.normalized)).then(response => {
                 if (!response || response.ok === false) return null;
-
-                if (typeof response.blob === "function") {
-                    return Promise.resolve(response.blob()).catch(() => null);
-                }
-
-                if (typeof response.arrayBuffer === "function" && typeof Blob === "function") {
-                    return Promise.resolve(response.arrayBuffer())
-                        .then(buffer => new Blob([buffer], { type: parsed.mime }))
-                        .catch(() => null);
-                }
-
-                return null;
+                if (typeof response.blob !== "function") return null;
+                return Promise.resolve(response.blob()).then(blob => {
+                    if (!blob) return null;
+                    const mime = blob.type || parsed.mime || "image/png";
+                    if (typeof File === "function") {
+                        return new File([blob], fileName, { type: mime });
+                    }
+                    return Object.assign(blob, {
+                        name: fileName,
+                        fileName,
+                        filename: fileName,
+                        mimeType: mime,
+                        type: mime,
+                    });
+                }).catch(() => null);
             }).catch(() => null);
         };
 
-        const tryDecodeBlob = () => {
-            if (typeof Blob !== "function") return null;
-
-            const { body, isBase64, mime } = parsed;
-            try {
-                if (isBase64) {
-                    if (typeof atob === "function") {
-                        const binary = atob(body);
-                        const bytes = new Uint8Array(binary.length);
-                        for (let i = 0; i < binary.length; i++) {
-                            bytes[i] = binary.charCodeAt(i);
-                        }
-                        return new Blob([bytes], { type: mime });
-                    }
-
-                    const bytes = decodeBase64ToBytes(body);
-                    return new Blob([bytes], { type: mime });
-                }
-
-                const text = decodeURIComponent(body);
-                return new Blob([text], { type: mime });
-            } catch {
-                return null;
-            }
-        };
-
-        return tryFetchBlob().then(blob => blob ?? tryDecodeBlob());
+        return tryFetch().then(uploadable => uploadable ?? tryDecode());
     }
 
     function resolveChannel(channelId) {
@@ -1132,8 +1240,39 @@ render().catch(error => {
         });
     }
 
+    function invokePromptUploadDirect(candidate, uploadable, channel, channelId, draftType) {
+        const fn = candidate?.fn;
+        if (typeof fn !== "function") return Promise.reject(new Error("Invalid upload candidate."));
+
+        const call = function () {
+            return fn.apply(candidate.ctx ?? null, arguments);
+        };
+        const attempts = [
+            () => call([uploadable], channel, draftType),
+            () => call([uploadable], channel, 0),
+            () => call([uploadable], channel),
+            () => call([uploadable], channelId, draftType),
+            () => call([uploadable], channelId, 0),
+            () => call([uploadable], channelId),
+        ];
+
+        let lastError = null;
+        for (const attempt of attempts) {
+            try {
+                return Promise.resolve(attempt());
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        return Promise.reject(lastError instanceof Error ? lastError : new Error("Failed to invoke promptToUpload."));
+    }
+
     function sendGeneratedImage(message, dataUrl) {
-        const uploadCandidates = buildUploadFunctionCandidates(true);
+        const uploadCandidates = buildUploadFunctionCandidates(true)
+            .filter(isLikelyPrimaryUploaderCandidate)
+            .sort((a, b) => b.score - a.score);
+
         if (!uploadCandidates.length) {
             return Promise.reject(new Error(`Upload handler unavailable on this build. ${lastUploadLookupDiagnostics}`));
         }
@@ -1145,72 +1284,15 @@ render().catch(error => {
         if (!channel) return Promise.reject(new Error("Unable to resolve channel object."));
 
         const fileName = buildFileName(message);
-        return Promise.resolve(dataUrlToBlob(dataUrl)).then(blob => {
-            if (!blob) throw new Error("Invalid rendered quote image.");
-
-            const mimeType = typeof blob.type === "string" && blob.type ? blob.type : "image/png";
-            const uploadable = typeof File === "function"
-                ? new File([blob], fileName, { type: mimeType })
-                : Object.assign(blob, {
-                    name: fileName,
-                    fileName,
-                    filename: fileName,
-                    mimeType,
-                    type: mimeType,
-                });
+        return Promise.resolve(dataUrlToUploadable(dataUrl, fileName)).then(uploadable => {
+            if (!uploadable) throw new Error("Invalid rendered quote image.");
 
             const draftType = getChannelMessageDraftType();
-            const rankedCandidates = uploadCandidates.slice(0, 90);
-            logDebug("Send quote using upload candidates", rankedCandidates.map(c => `${c.key}@${c.source}[${c.score}]`).join(", "));
-
-            return new Promise((resolve, reject) => {
-                let index = 0;
-                let lastError = null;
-                const shortErrors = [];
-
-                const run = () => {
-                    if (index >= rankedCandidates.length) {
-                        const fallbackError = lastError instanceof Error
-                            ? lastError
-                            : new Error("Upload handler invocation failed for all candidates.");
-                        logError(`Upload failed after ${rankedCandidates.length} candidates`, fallbackError);
-                        const details = shortErrors.length ? ` last=${shortErrors.join(" | ")}` : "";
-                        cachedUploadCandidates = null;
-                        tryUploadViaUploadManager(uploadable, channel, channelId, draftType, fileName).then(() => {
-                            logDebug("Upload fallback succeeded", "UploadManager.addFile + sendMessage");
-                            resolve();
-                        }).catch(uploadManagerError => {
-                            const managerMsg = uploadManagerError instanceof Error ? uploadManagerError.message : String(uploadManagerError);
-                            reject(new Error(`${fallbackError.message}.${details} uploadManager=${managerMsg} ${lastUploadLookupDiagnostics}`));
-                        });
-                        return;
-                    }
-
-                    const candidate = rankedCandidates[index++];
-                    invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType, fileName).then(() => {
-                        const uploadEntryExists = hasUploadForFile(channelId, fileName, draftType);
-                        if (uploadEntryExists && !isLikelyPrimaryUploaderCandidate(candidate)) {
-                            trySendDraftWithAttachment(channelId).then(() => {
-                                logDebug("Upload candidate succeeded", `${candidate.key}@${candidate.source}[${candidate.score}] + sendMessage`);
-                                resolve();
-                            }).catch(error => {
-                                lastError = error;
-                                run();
-                            });
-                            return;
-                        }
-
-                        logDebug("Upload candidate succeeded", `${candidate.key}@${candidate.source}[${candidate.score}]`);
-                        resolve();
-                    }).catch(error => {
-                        lastError = error;
-                        const msg = error instanceof Error ? error.message : String(error);
-                        if (shortErrors.length < 5) shortErrors.push(`${candidate.key}:${msg}`);
-                        run();
-                    });
-                };
-
-                run();
+            const primary = uploadCandidates[0];
+            logDebug("Send quote using upload handler", `${primary.key}@${primary.source}[${primary.score}]`);
+            return invokePromptUploadDirect(primary, uploadable, channel, channelId, draftType).catch(error => {
+                const message = error instanceof Error ? error.message : String(error);
+                throw new Error(`Upload handler invocation failed: ${message}`);
             });
         });
     }
