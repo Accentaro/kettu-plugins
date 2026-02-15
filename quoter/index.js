@@ -54,6 +54,20 @@
         watermarkPadding: 20,
     };
 
+    const UPLOAD_METHOD_NAMES = [
+        "promptToUpload",
+        "showUploadDialog",
+        "uploadFiles",
+        "handleUpload",
+    ];
+
+    const UPLOAD_SIGNATURES = [
+        "Unexpected mismatch between files and file metadata",
+        "showLargeMessageDialog",
+        "canUploadLongMessages",
+        "promptToUpload",
+    ];
+
     function ensureDefaults() {
         storage.grayscale ??= DEFAULTS.grayscale;
         storage.showWatermark ??= DEFAULTS.showWatermark;
@@ -378,32 +392,19 @@ render().catch(error => {
             ?? safeFind(() => metro.findByProps("getChannel"));
     }
 
-    function getUploadModule() {
-        const candidates = [
-            safeFind(() => metro.findByProps("promptToUpload")),
-            safeFind(() => metro.findByProps("promptToUpload", "showUploadDialog")),
-            safeFind(() => metro.findByProps("showUploadDialog", "canUploadLongMessages")),
-            safeFind(() => metro.findByProps("showUploadDialog")),
-        ];
-
-        for (const candidate of candidates) {
-            if (!candidate || typeof candidate !== "object") continue;
-            if (typeof candidate.promptToUpload === "function") return candidate;
-            if (typeof candidate.showUploadDialog === "function") return candidate;
-        }
-
-        return null;
-    }
-
     let cachedPromptToUpload = null;
+    let cachedPromptToUploadSource = "unknown";
+    let lastUploadLookupDiagnostics = "lookup not run";
+
+    function normalizeLower(value) {
+        return String(value || "").toLowerCase();
+    }
 
     function functionContainsUploadSignature(fn) {
         if (typeof fn !== "function") return false;
         try {
             const source = String(fn);
-            return source.includes("Unexpected mismatch between files and file metadata")
-                || source.includes("=!0,showLargeMessageDialog:")
-                || source.includes("showLargeMessageDialog");
+            return UPLOAD_SIGNATURES.some(signature => source.includes(signature));
         } catch {
             return false;
         }
@@ -412,38 +413,54 @@ render().catch(error => {
     function getPromptCandidateFromObject(root) {
         if (!root || (typeof root !== "object" && typeof root !== "function")) return null;
 
-        const directNames = [
-            "promptToUpload",
-            "showUploadDialog",
-            "uploadFiles",
-            "handleUpload",
-        ];
-        for (const name of directNames) {
+        if (typeof root === "function") {
+            const fnName = normalizeLower(root.name);
+            if (fnName === "prompttoupload" || functionContainsUploadSignature(root)) {
+                return { fn: root, ctx: null, key: root.name || "<function>" };
+            }
+        }
+
+        for (const name of UPLOAD_METHOD_NAMES) {
             try {
                 const fn = root?.[name];
-                if (typeof fn === "function") return { fn, ctx: root };
+                if (typeof fn === "function") return { fn, ctx: root, key: name };
             } catch { }
         }
 
         const queue = [{ value: root, depth: 0 }];
         const seen = new Set();
-        while (queue.length) {
+        let scannedNodes = 0;
+
+        while (queue.length && scannedNodes < 450) {
+            scannedNodes++;
             const { value, depth } = queue.shift();
             if (!value || (typeof value !== "object" && typeof value !== "function")) continue;
             if (seen.has(value)) continue;
             seen.add(value);
 
-            let entries = [];
+            let keys = [];
             try {
-                entries = Object.entries(value);
+                keys = Object.getOwnPropertyNames(value);
             } catch { }
 
-            for (const [key, child] of entries.slice(0, 120)) {
+            for (const key of keys.slice(0, 180)) {
+                let child;
+                try {
+                    child = value[key];
+                } catch {
+                    continue;
+                }
+
                 if (typeof child === "function") {
-                    if (key === "promptToUpload" || functionContainsUploadSignature(child)) {
-                        return { fn: child, ctx: value };
+                    const keyLower = normalizeLower(key);
+                    const uploadNameHint = keyLower.includes("upload")
+                        || keyLower.includes("large")
+                        || keyLower.includes("prompt");
+
+                    if (key === "promptToUpload" || (uploadNameHint && functionContainsUploadSignature(child)) || functionContainsUploadSignature(child)) {
+                        return { fn: child, ctx: value, key };
                     }
-                } else if (child && typeof child === "object" && depth < 2) {
+                } else if ((typeof child === "object" || typeof child === "function") && child && depth < 3) {
                     queue.push({ value: child, depth: depth + 1 });
                 }
             }
@@ -452,43 +469,147 @@ render().catch(error => {
         return null;
     }
 
+    function getMetroModuleEntries() {
+        const modules = metro?.modules ?? globalThis?.modules;
+        if (!modules) return [];
+        if (modules instanceof Map) return Array.from(modules.entries());
+        if (typeof modules === "object") return Object.entries(modules);
+        return [];
+    }
+
+    function getInitializedModuleExports(entry) {
+        if (!entry || typeof entry !== "object") return null;
+        const exports = entry?.publicModule?.exports;
+        return exports ?? null;
+    }
+
+    function getFactorySource(factory) {
+        if (typeof factory !== "function") return "";
+        try {
+            return String(factory);
+        } catch {
+            return "";
+        }
+    }
+
+    function hasUploadKeyHints(value) {
+        if (!value || (typeof value !== "object" && typeof value !== "function")) return false;
+        if (typeof value === "function") {
+            return functionContainsUploadSignature(value) || normalizeLower(value.name).includes("upload");
+        }
+
+        let keys = [];
+        try {
+            keys = Object.getOwnPropertyNames(value);
+        } catch {
+            return false;
+        }
+
+        for (const key of keys.slice(0, 80)) {
+            const keyLower = normalizeLower(key);
+            if (UPLOAD_METHOD_NAMES.includes(key)) return true;
+            if (keyLower.includes("upload") || keyLower.includes("draft") || keyLower.includes("large")) return true;
+        }
+
+        return false;
+    }
+
+    function bindPromptCandidate(candidate, sourceLabel) {
+        if (!candidate || typeof candidate.fn !== "function") return null;
+        cachedPromptToUploadSource = sourceLabel || "unknown";
+        cachedPromptToUpload = function () {
+            return candidate.fn.apply(candidate.ctx ?? null, arguments);
+        };
+        return cachedPromptToUpload;
+    }
+
+    function getMetroLookupCandidates() {
+        const candidates = [];
+        const append = (value, label) => {
+            if (value == null) return;
+            if (Array.isArray(value)) {
+                value.forEach((item, index) => append(item, `${label}[${index}]`));
+                return;
+            }
+            candidates.push({ value, label });
+        };
+
+        append(safeFind(() => metro.findByProps("promptToUpload")), "findByProps(promptToUpload)");
+        append(safeFind(() => metro.findByProps("promptToUpload", "showUploadDialog")), "findByProps(promptToUpload,showUploadDialog)");
+        append(safeFind(() => metro.findByProps("showUploadDialog", "canUploadLongMessages")), "findByProps(showUploadDialog,canUploadLongMessages)");
+        append(safeFind(() => metro.findByProps("showUploadDialog")), "findByProps(showUploadDialog)");
+        append(safeFind(() => metro.findByProps("showLargeMessageDialog")), "findByProps(showLargeMessageDialog)");
+        append(safeFind(() => metro.findByPropsAll("promptToUpload")), "findByPropsAll(promptToUpload)");
+        append(safeFind(() => metro.findByName("promptToUpload", false)), "findByName(promptToUpload,false)");
+        append(safeFind(() => metro.findByName("showUploadDialog", false)), "findByName(showUploadDialog,false)");
+        append(safeFind(() => metro.find(candidate => hasUploadKeyHints(candidate))), "find(hasUploadKeyHints)");
+
+        return candidates;
+    }
+
     function getUploadPromptToUpload() {
         if (typeof cachedPromptToUpload === "function") return cachedPromptToUpload;
+        lastUploadLookupDiagnostics = "lookup started";
 
-        const uploadModule = getUploadModule();
-        const fromUploadModule = getPromptCandidateFromObject(uploadModule);
-        if (fromUploadModule?.fn) {
-            cachedPromptToUpload = (...args) => fromUploadModule.fn.apply(fromUploadModule.ctx, args);
-            return cachedPromptToUpload;
+        const directCandidates = getMetroLookupCandidates();
+        for (const candidate of directCandidates) {
+            const match = getPromptCandidateFromObject(candidate.value);
+            if (match?.fn) {
+                return bindPromptCandidate(match, candidate.label);
+            }
         }
 
-        const largeMessageModule = safeFind(() => metro.findByProps("showLargeMessageDialog"));
-        const fromLargeMessageModule = getPromptCandidateFromObject(largeMessageModule);
-        if (fromLargeMessageModule?.fn) {
-            cachedPromptToUpload = (...args) => fromLargeMessageModule.fn.apply(fromLargeMessageModule.ctx, args);
-            return cachedPromptToUpload;
+        const moduleEntries = getMetroModuleEntries();
+        let initializedWithHints = 0;
+        for (const [id, entry] of moduleEntries) {
+            const exports = getInitializedModuleExports(entry);
+            if (!exports || !hasUploadKeyHints(exports)) continue;
+            initializedWithHints++;
+
+            const match = getPromptCandidateFromObject(exports)
+                ?? getPromptCandidateFromObject(exports?.default);
+            if (match?.fn) {
+                return bindPromptCandidate(match, `initialized-module:${id}`);
+            }
         }
 
-        const broadModule = safeFind(() =>
-            metro.find(candidate => {
-                if (!candidate) return false;
-                if (typeof candidate === "function") return functionContainsUploadSignature(candidate);
-                if (typeof candidate !== "object") return false;
+        const metroRequire = typeof globalThis?.__r === "function" ? globalThis.__r : null;
+        let requiredCandidateCount = 0;
+        if (metroRequire) {
+            const candidateIds = [];
 
-                try {
-                    return Object.values(candidate).some(value =>
-                        typeof value === "function" && functionContainsUploadSignature(value),
-                    );
-                } catch {
-                    return false;
+            for (const [id, entry] of moduleEntries) {
+                if (!entry || typeof entry !== "object") continue;
+                const source = getFactorySource(entry.factory);
+                if (!source) continue;
+
+                if (UPLOAD_SIGNATURES.some(signature => source.includes(signature))) {
+                    candidateIds.push(id);
                 }
-            }),
-        );
-        const fromBroadModule = getPromptCandidateFromObject(broadModule);
-        if (fromBroadModule?.fn) {
-            cachedPromptToUpload = (...args) => fromBroadModule.fn.apply(fromBroadModule.ctx, args);
-            return cachedPromptToUpload;
+            }
+
+            for (const id of candidateIds.slice(0, 80)) {
+                requiredCandidateCount++;
+                let exports;
+                try {
+                    exports = metroRequire(Number(id));
+                } catch {
+                    continue;
+                }
+
+                const match = getPromptCandidateFromObject(exports)
+                    ?? getPromptCandidateFromObject(exports?.default);
+                if (match?.fn) {
+                    return bindPromptCandidate(match, `required-module:${id}`);
+                }
+            }
         }
+
+        lastUploadLookupDiagnostics = [
+            `directCandidates=${directCandidates.length}`,
+            `initializedHintedModules=${initializedWithHints}`,
+            `requiredFactoryCandidates=${requiredCandidateCount}`,
+        ].join(", ");
 
         return null;
     }
@@ -549,7 +670,7 @@ render().catch(error => {
     function sendGeneratedImage(message, dataUrl) {
         const promptToUpload = getUploadPromptToUpload();
         if (typeof promptToUpload !== "function") {
-            return Promise.reject(new Error("Upload handler unavailable on this build."));
+            return Promise.reject(new Error(`Upload handler unavailable on this build. ${lastUploadLookupDiagnostics}`));
         }
 
         const channelId = getMessageChannelId(message);
@@ -576,11 +697,17 @@ render().catch(error => {
 
         const draftType = getChannelMessageDraftType();
         const attempts = [
+            () => promptToUpload([uploadable], channel, 0),
             () => promptToUpload([uploadable], channel, draftType),
             () => promptToUpload([uploadable], channel),
+            () => promptToUpload([uploadable], channelId, 0),
+            () => promptToUpload([uploadable], channelId, draftType),
+            () => promptToUpload([uploadable], channelId),
             () => promptToUpload(channel, [uploadable], draftType),
+            () => promptToUpload(channelId, [uploadable], draftType),
             () => promptToUpload({
                 channel,
+                channelId,
                 files: [uploadable],
                 uploads: [uploadable],
                 draftType,
@@ -598,7 +725,7 @@ render().catch(error => {
 
         return Promise.reject(lastError instanceof Error
             ? lastError
-            : new Error("Upload handler invocation failed on this build."));
+            : new Error(`Upload handler invocation failed on this build (${cachedPromptToUploadSource}).`));
     }
 
     function QuotePreviewCard({ message, onStateChange }) {
