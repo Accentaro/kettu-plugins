@@ -21,7 +21,11 @@
     const ReactNative = common.ReactNative;
 
     const actionSheetModule = metro.findByProps("openLazy", "hideActionSheet");
-    const messageUtil = common.messageUtil;
+    const messageActions = metro.findByProps("sendMessage", "revealMessage")
+        ?? metro.findByProps("sendMessage", "receiveMessage")
+        ?? metro.findByProps("sendMessage");
+    const avatarUtils = metro.findByProps("getUserAvatarURL", "getUserAvatarSource")
+        ?? metro.findByProps("getUserAvatarURL");
     const clipboard = common.clipboard;
 
     function ensureDefaults() {
@@ -66,7 +70,37 @@
         return author?.globalName || author?.global_name || author?.username || "Unknown";
     }
 
+    function getAuthorId(author) {
+        return author?.id ?? author?.userId ?? author?.user_id ?? null;
+    }
+
+    function getAuthorAvatarHash(author) {
+        return author?.avatar ?? author?.avatarHash ?? author?.avatar_hash ?? null;
+    }
+
+    function getDiscordCdnAvatarUrl(author) {
+        const authorId = getAuthorId(author);
+        const avatarHash = getAuthorAvatarHash(author);
+
+        if (authorId && avatarHash) {
+            const animated = String(avatarHash).startsWith("a_");
+            const ext = animated ? "gif" : "png";
+            return `https://cdn.discordapp.com/avatars/${authorId}/${avatarHash}.${ext}?size=512`;
+        }
+
+        return "https://cdn.discordapp.com/embed/avatars/0.png?size=512";
+    }
+
     function getAuthorAvatarUrl(author) {
+        try {
+            if (avatarUtils && typeof avatarUtils.getUserAvatarURL === "function") {
+                const avatarFromModule = avatarUtils.getUserAvatarURL(author, true);
+                if (typeof avatarFromModule === "string" && avatarFromModule.length > 0) {
+                    return upgradeAvatarUrl(avatarFromModule);
+                }
+            }
+        } catch { }
+
         try {
             if (typeof author?.getAvatarURL === "function") {
                 return upgradeAvatarUrl(author.getAvatarURL());
@@ -75,7 +109,7 @@
 
         if (typeof author?.avatarURL === "string") return upgradeAvatarUrl(author.avatarURL);
         if (typeof author?.avatarUrl === "string") return upgradeAvatarUrl(author.avatarUrl);
-        return "";
+        return upgradeAvatarUrl(getDiscordCdnAvatarUrl(author));
     }
 
     function getQuoteUrl(message) {
@@ -111,15 +145,67 @@
         const channelId = getMessageChannelId(message);
         if (!channelId) throw new Error("Unable to resolve message channel.");
 
-        if (!messageUtil || typeof messageUtil.sendMessage !== "function") {
+        if (!messageActions || typeof messageActions.sendMessage !== "function") {
             throw new Error("Unable to send message from this client build.");
         }
 
-        messageUtil.sendMessage(
+        messageActions.sendMessage(
             channelId,
-            { content: quoteUrl },
+            {
+                content: quoteUrl,
+                tts: false,
+                invalidEmojis: [],
+                validNonShortcutEmojis: [],
+            },
             undefined,
             { nonce: Date.now().toString() },
+        );
+    }
+
+    function renderQuotePreview(quoteUrl) {
+        const width = Math.max(
+            220,
+            Math.min(
+                320,
+                (ReactNative?.Dimensions?.get?.("window")?.width ?? 320) - 96,
+            ),
+        );
+        const height = Math.round(width * 0.56);
+
+        return React.createElement(
+            ReactNative.View,
+            {
+                style: {
+                    marginTop: 12,
+                    marginBottom: 4,
+                    alignItems: "center",
+                },
+            },
+            [
+                React.createElement(ReactNative.Image, {
+                    key: "quote-preview-image",
+                    source: { uri: quoteUrl },
+                    resizeMode: "cover",
+                    style: {
+                        width,
+                        height,
+                        borderRadius: 12,
+                        backgroundColor: "#111",
+                    },
+                }),
+                React.createElement(
+                    ReactNative.Text,
+                    {
+                        key: "quote-preview-text",
+                        style: {
+                            color: "#aaa",
+                            marginTop: 8,
+                            fontSize: 12,
+                        },
+                    },
+                    "Preview generated from selected message",
+                ),
+            ],
         );
     }
 
@@ -191,13 +277,15 @@
 
     function handleQuoteAction(message) {
         const quoteUrl = getQuoteUrl(message);
+        const preview = renderQuotePreview(quoteUrl);
 
         alerts.showConfirmationAlert({
             title: "Create Quote",
-            content: "Send quote image URL in chat or copy it to clipboard.",
+            content: "Send quote image link in chat or copy the image link.",
+            children: preview,
             confirmText: "Send",
             cancelText: "Cancel",
-            secondaryConfirmText: "Copy URL",
+            secondaryConfirmText: "Copy Link",
             onConfirm: () => {
                 try {
                     sendQuoteMessage(message, quoteUrl);
