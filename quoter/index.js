@@ -486,6 +486,8 @@ render().catch(error => {
         if (functionContainsUploadSignature(fn)) score += 120;
         if (typeof fn.length === "number" && fn.length >= 1 && fn.length <= 5) score += 10;
         if (/^[A-Z0-9_]+$/.test(String(key)) && String(key).includes("_")) score -= 45;
+        if (keyLower.includes("config") || keyLower.includes("limit") || keyLower.includes("roadblock") || keyLower.includes("error")) score -= 35;
+        if (keyLower.startsWith("get") && !keyLower.includes("upload")) score -= 20;
 
         return score;
     }
@@ -655,11 +657,15 @@ render().catch(error => {
         };
 
         append(safeFind(() => metro.findByProps("promptToUpload")), "findByProps(promptToUpload)");
+        append(safeFind(() => metro.findByProps("showUploadFileSizeExceededError", "promptToUpload")), "findByProps(showUploadFileSizeExceededError,promptToUpload)");
+        append(safeFind(() => metro.findByProps("showUploadFileSizeExceededError")), "findByProps(showUploadFileSizeExceededError)");
         append(safeFind(() => metro.findByProps("promptToUpload", "showUploadDialog")), "findByProps(promptToUpload,showUploadDialog)");
         append(safeFind(() => metro.findByProps("showUploadDialog", "canUploadLongMessages")), "findByProps(showUploadDialog,canUploadLongMessages)");
         append(safeFind(() => metro.findByProps("showUploadDialog")), "findByProps(showUploadDialog)");
         append(safeFind(() => metro.findByProps("showLargeMessageDialog")), "findByProps(showLargeMessageDialog)");
+        append(safeFind(() => metro.findByProps("clearAll", "addFile")), "findByProps(clearAll,addFile)");
         append(safeFind(() => metro.findByPropsAll("promptToUpload")), "findByPropsAll(promptToUpload)");
+        append(safeFind(() => metro.findByPropsAll("showUploadFileSizeExceededError", "promptToUpload")), "findByPropsAll(showUploadFileSizeExceededError,promptToUpload)");
         append(safeFind(() => metro.findByName("promptToUpload", false)), "findByName(promptToUpload,false)");
         append(safeFind(() => metro.findByName("showUploadDialog", false)), "findByName(showUploadDialog,false)");
         append(safeFind(() => metro.find(candidate => hasUploadKeyHints(candidate))), "find(hasUploadKeyHints)");
@@ -690,9 +696,14 @@ render().catch(error => {
         for (const candidate of directCandidates) {
             const match = getPromptCandidateFromObject(candidate.value);
             if (match?.fn) {
+                const directBoost = candidate.label.includes("showUploadFileSizeExceededError,promptToUpload")
+                    ? 1200
+                    : candidate.label.includes("findByProps(promptToUpload)")
+                        ? 900
+                        : 300;
                 pushUploadCandidate(uploadCandidates, seenFns, {
                     ...createUploadCandidate(match.fn, match.ctx, match.key, candidate.label),
-                    score: (match.score || 0) + 300,
+                    score: (match.score || 0) + directBoost,
                 });
             }
 
@@ -819,6 +830,7 @@ render().catch(error => {
 
         const beforeUploads = getUploadsForChannel(channelId, draftType).length;
         const hasStore = Boolean(getUploadAttachmentStore());
+        const primaryCandidate = isLikelyPrimaryUploaderCandidate(candidate);
 
         let lastError = null;
         return new Promise((resolve, reject) => {
@@ -838,22 +850,35 @@ render().catch(error => {
                 }
 
                 Promise.resolve(result).then(() => {
-                    if (!hasStore) {
+                    if (primaryCandidate || !hasStore) {
                         resolve();
                         return;
                     }
 
-                    Promise.resolve()
-                        .then(() => waitMs(80))
-                        .then(() => {
+                    const waitForUploadEntry = () => new Promise((res, rej) => {
+                        const startedAt = Date.now();
+                        const poll = () => {
                             const afterUploads = getUploadsForChannel(channelId, draftType).length;
                             const fileFound = hasUploadForFile(channelId, fileName, draftType);
                             if (fileFound || afterUploads > beforeUploads) {
-                                resolve();
+                                res(true);
                                 return;
                             }
 
-                            throw new Error("No upload entry was created.");
+                            if (Date.now() - startedAt >= 900) {
+                                rej(new Error("No upload entry was created."));
+                                return;
+                            }
+
+                            waitMs(120).then(poll).catch(rej);
+                        };
+
+                        waitMs(140).then(poll).catch(rej);
+                    });
+
+                    waitForUploadEntry()
+                        .then(() => {
+                            resolve();
                         })
                         .catch(error => {
                             lastError = error;
@@ -965,6 +990,21 @@ render().catch(error => {
 
     function waitMs(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function isLikelyPrimaryUploaderCandidate(candidate) {
+        const key = normalizeLower(candidate?.key || "");
+        const source = normalizeLower(candidate?.source || "");
+        if (key === "prompttoupload") return true;
+        if (source.includes("showuploadfilesizeexceedederror,prompttoupload")) return true;
+        if (source.includes("findbyprops(prompttoupload)")) return true;
+
+        try {
+            const text = String(candidate?.fn || "");
+            return text.includes("Unexpected mismatch between files and file metadata");
+        } catch {
+            return false;
+        }
     }
 
     function sendGeneratedImage(message, dataUrl) {
