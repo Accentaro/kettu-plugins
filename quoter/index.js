@@ -20,37 +20,12 @@
     const React = common.React;
     const ReactNative = common.ReactNative;
 
-    const safeGet = (factory, fallback = null) => {
-        try {
-            const value = factory?.();
-            return value ?? fallback;
-        } catch {
-            return fallback;
-        }
-    };
-
-    const globalRoot = typeof globalThis !== "undefined"
-        ? globalThis
-        : (typeof global !== "undefined" ? global : (typeof window !== "undefined" ? window : {}));
-
-    const actionSheetModule = safeGet(() => metro.findByProps("openLazy", "hideActionSheet"));
-    const messageActions = safeGet(() => metro.findByProps("sendMessage", "revealMessage"))
-        ?? safeGet(() => metro.findByProps("sendMessage", "receiveMessage"))
-        ?? safeGet(() => metro.findByProps("sendMessage"));
-    const avatarUtils = safeGet(() => metro.findByProps("getUserAvatarURL", "getUserAvatarSource"))
-        ?? safeGet(() => metro.findByProps("getUserAvatarURL"));
-    const uploadHandler = safeGet(() => metro.findByProps("promptToUpload"))
-        ?? safeGet(() => metro.findByProps("promptToUpload", "showUploadDialog"));
-    const channelStore = safeGet(
-        () => (typeof metro.findByStoreName === "function" ? metro.findByStoreName("ChannelStore") : null),
-        null,
-    );
-    const webViewModule = safeGet(() => metro.findByProps("WebView"))
-        ?? safeGet(() => metro.find(module => module && module.WebView && !module.default));
-    const WebView = webViewModule?.WebView ?? null;
-    const nativeFileModule = globalRoot?.nativeModuleProxy?.NativeFileModule
-        ?? globalRoot?.nativeModuleProxy?.DCDFileManager
-        ?? null;
+    const actionSheetModule = metro.findByProps("openLazy", "hideActionSheet");
+    const messageActions = metro.findByProps("sendMessage", "revealMessage")
+        ?? metro.findByProps("sendMessage", "receiveMessage")
+        ?? metro.findByProps("sendMessage");
+    const avatarUtils = metro.findByProps("getUserAvatarURL", "getUserAvatarSource")
+        ?? metro.findByProps("getUserAvatarURL");
     const clipboard = common.clipboard;
 
     function ensureDefaults() {
@@ -144,204 +119,11 @@
         return upgradeAvatarUrl(getDiscordCdnAvatarUrl(author));
     }
 
-    function cleanQuoteText(text) {
-        if (!text) return "";
-
-        // Remove custom emoji markup and normalize mentions to plain text.
-        const withoutEmoji = String(text).replace(/<a?:\w+:\d+>/g, "");
-        const mentionsNormalized = withoutEmoji.replace(/<@!?\d+>/g, "@user");
-        const scriptSafe = mentionsNormalized.replace(/[<>]/g, "");
-        return normalizeText(scriptSafe);
-    }
-
-    function getAuthorUsername(author) {
-        return String(author?.username || "unknown").replace(/[^\w.-]/g, "").slice(0, 32) || "unknown";
-    }
-
-    function buildQuoteFileName(message) {
-        const author = getMessageAuthor(message);
-        const user = getAuthorUsername(author);
-        const textPreview = cleanQuoteText(message?.content).split(" ").filter(Boolean).slice(0, 6).join(" ");
-        const safeText = textPreview.replace(/[^\w.-]/g, "_").slice(0, 48) || "quote";
-        return `${safeText}-${user}.png`;
-    }
-
-    function buildLocalQuotePayload(message, options = {}) {
-        const author = getMessageAuthor(message);
-
-        return {
-            quote: cleanQuoteText(message?.content || "").slice(0, 420) || " ",
-            displayName: getAuthorDisplayName(author).slice(0, 64),
-            username: `@${getAuthorUsername(author)}`,
-            avatarUrl: getAuthorAvatarUrl(author),
-            grayscale: Boolean(options.grayscale),
-            showWatermark: Boolean(options.showWatermark),
-            watermark: String(options.watermark || "").slice(0, 32),
-        };
-    }
-
-    function buildQuoteRendererHtml(payload) {
-        return `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<style>
-html, body {
-    margin: 0;
-    padding: 0;
-    background: #000;
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-}
-#c {
-    width: 100%;
-    height: 100%;
-    display: block;
-}
-</style>
-</head>
-<body>
-<canvas id="c" width="1200" height="675"></canvas>
-<script>
-const payload = ${JSON.stringify(payload)};
-
-function post(data) {
-    try {
-        window.ReactNativeWebView.postMessage(JSON.stringify(data));
-    } catch {}
-}
-
-function fitText(ctx, text, maxWidth, maxHeight) {
-    let size = 72;
-    const minSize = 24;
-    const lineMult = 1.2;
-    const words = text.split(" ");
-
-    function linesFor(currentSize) {
-        ctx.font = "300 " + currentSize + "px sans-serif";
-        const lines = [];
-        let line = "";
-        for (const word of words) {
-            const next = line ? line + " " + word : word;
-            if (ctx.measureText(next).width > maxWidth && line) {
-                lines.push(line);
-                line = word;
-            } else {
-                line = next;
-            }
-        }
-        if (line) lines.push(line);
-        return lines;
-    }
-
-    while (size >= minSize) {
-        const lines = linesFor(size);
-        const contentHeight = lines.length * (size * lineMult);
-        if (contentHeight <= maxHeight) return { size, lines, lineHeight: size * lineMult };
-        size -= 2;
-    }
-
-    const finalLines = linesFor(minSize);
-    return { size: minSize, lines: finalLines, lineHeight: minSize * lineMult };
-}
-
-async function draw() {
-    const canvas = document.getElementById("c");
-    const ctx = canvas.getContext("2d");
-    const W = canvas.width;
-    const H = canvas.height;
-    const leftW = H;
-    const rightX = leftW;
-    const quoteX = rightX + 30;
-    const quoteW = W - quoteX - 30;
-
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, W, H);
-
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.decoding = "async";
-
-    img.onload = () => {
-        if (payload.grayscale) ctx.filter = "grayscale(1)";
-        ctx.drawImage(img, 0, 0, leftW, H);
-        ctx.filter = "none";
-
-        const fade = ctx.createLinearGradient(leftW - 200, 0, leftW, 0);
-        fade.addColorStop(0, "rgba(0,0,0,0)");
-        fade.addColorStop(1, "rgba(0,0,0,1)");
-        ctx.fillStyle = fade;
-        ctx.fillRect(leftW - 200, 0, 200, H);
-
-        ctx.fillStyle = "#000";
-        ctx.fillRect(rightX, 0, W - rightX, H);
-
-        const textCalc = fitText(ctx, payload.quote, quoteW, H - 230);
-        ctx.fillStyle = "#fff";
-        ctx.textBaseline = "alphabetic";
-        ctx.font = "300 " + textCalc.size + "px sans-serif";
-
-        const blockHeight = textCalc.lines.length * textCalc.lineHeight;
-        let y = Math.max(160, (H - blockHeight) / 2);
-        for (const line of textCalc.lines) {
-            const x = quoteX + (quoteW - ctx.measureText(line).width) / 2;
-            y += textCalc.lineHeight;
-            ctx.fillText(line, x, y);
-        }
-
-        const authorName = "- " + payload.displayName;
-        ctx.font = "italic 300 " + Math.max(28, textCalc.size * 0.45) + "px sans-serif";
-        const authorX = quoteX + (quoteW - ctx.measureText(authorName).width) / 2;
-        const authorY = y + 48;
-        ctx.fillText(authorName, authorX, authorY);
-
-        ctx.fillStyle = "#8a8a8a";
-        ctx.font = "300 " + Math.max(18, textCalc.size * 0.32) + "px sans-serif";
-        const userX = quoteX + (quoteW - ctx.measureText(payload.username).width) / 2;
-        const userY = authorY + 34;
-        ctx.fillText(payload.username, userX, userY);
-
-        if (payload.showWatermark && payload.watermark) {
-            ctx.fillStyle = "#666";
-            ctx.font = "300 22px sans-serif";
-            const mark = payload.watermark.slice(0, 32);
-            const markX = W - ctx.measureText(mark).width - 18;
-            const markY = H - 16;
-            ctx.fillText(mark, markX, markY);
-        }
-
-        try {
-            const dataUrl = canvas.toDataURL("image/png");
-            post({ type: "result", dataUrl });
-        } catch (error) {
-            post({ type: "error", message: String(error && error.message ? error.message : error) });
-        }
-    };
-
-    img.onerror = () => {
-        post({ type: "error", message: "Failed to load avatar image in renderer." });
-    };
-    img.src = payload.avatarUrl;
-}
-
-draw();
-</script>
-</body>
-</html>`;
-    }
-
-    function getQuoteUrl(message, options = null) {
+    function getQuoteUrl(message) {
         const text = normalizeText(message?.content).slice(0, 450);
         const author = getMessageAuthor(message);
         const name = getAuthorDisplayName(author).slice(0, 64);
         const image = getAuthorAvatarUrl(author);
-
-        const grayscale = options ? Boolean(options.grayscale) : Boolean(storage.grayscale);
-        const showWatermark = options ? Boolean(options.showWatermark) : Boolean(storage.showWatermark);
-        const watermark = options ? String(options.watermark ?? "") : String(storage.watermark ?? "");
-        const saveAsGif = options ? Boolean(options.saveAsGif) : Boolean(storage.saveAsGif);
 
         const endpoint = typeof storage.endpoint === "string" && storage.endpoint.trim()
             ? storage.endpoint.trim()
@@ -353,11 +135,11 @@ draw();
         if (image) url.searchParams.set("image", image);
 
         // Best-effort optional knobs for APIs that support these keys.
-        if (grayscale) url.searchParams.set("grayscale", "true");
-        if (showWatermark && watermark) {
-            url.searchParams.set("watermark", watermark.slice(0, 32));
+        if (storage.grayscale) url.searchParams.set("grayscale", "true");
+        if (storage.showWatermark && storage.watermark) {
+            url.searchParams.set("watermark", String(storage.watermark).slice(0, 32));
         }
-        if (saveAsGif) url.searchParams.set("format", "gif");
+        if (storage.saveAsGif) url.searchParams.set("format", "gif");
 
         return url.toString();
     }
@@ -387,296 +169,49 @@ draw();
         );
     }
 
-    async function sendGeneratedQuoteImage(message, dataUrl) {
-        const channelId = getMessageChannelId(message);
-        if (!channelId) throw new Error("Unable to resolve message channel.");
-
-        if (!uploadHandler || typeof uploadHandler.promptToUpload !== "function") {
-            throw new Error("Upload handler is unavailable on this build.");
-        }
-
-        const fileName = buildQuoteFileName(message);
-        const channel = channelStore?.getChannel?.(channelId) ?? { id: channelId };
-        let uploadItem = null;
-
-        const response = await fetch(dataUrl);
-        const blob = await response.blob();
-
-        if (typeof File === "function") {
-            uploadItem = new File([blob], fileName, { type: "image/png" });
-        } else {
-            const base64 = String(dataUrl).split(",")[1];
-            if (!base64 || !nativeFileModule || typeof nativeFileModule.writeFile !== "function") {
-                throw new Error("No compatible file upload path found.");
-            }
-
-            const savedPath = await nativeFileModule.writeFile(
-                "cache",
-                `kettu-quoter/${Date.now()}-${fileName}`,
-                base64,
-                "base64",
-            );
-            const uri = String(savedPath).startsWith("file://")
-                ? String(savedPath)
-                : `file://${savedPath}`;
-            uploadItem = {
-                uri,
-                fileName,
-                filename: fileName,
-                mimeType: "image/png",
-                type: "image/png",
-            };
-        }
-
-        uploadHandler.promptToUpload([uploadItem], channel, 0);
-    }
-
-    function QuotePreviewCard({ message, onPreviewState }) {
-        const [grayscale, setGrayscale] = React.useState(Boolean(storage.grayscale));
-        const [showWatermark, setShowWatermark] = React.useState(Boolean(storage.showWatermark));
-        const [saveAsGif, setSaveAsGif] = React.useState(Boolean(storage.saveAsGif));
-        const [watermark, setWatermark] = React.useState(String(storage.watermark ?? API_DEFAULTS.watermark));
-        const [generatedDataUrl, setGeneratedDataUrl] = React.useState(null);
-        const [renderError, setRenderError] = React.useState("");
-
-        const previewWidth = Math.max(
-            230,
-            Math.min((ReactNative?.Dimensions?.get?.("window")?.width ?? 360) - 88, 420),
+    function renderQuotePreview(quoteUrl) {
+        const width = Math.max(
+            220,
+            Math.min(
+                320,
+                (ReactNative?.Dimensions?.get?.("window")?.width ?? 320) - 96,
+            ),
         );
-        const previewHeight = Math.round(previewWidth * (675 / 1200));
-
-        React.useEffect(() => {
-            storage.grayscale = grayscale;
-            storage.showWatermark = showWatermark;
-            storage.saveAsGif = saveAsGif;
-            storage.watermark = watermark;
-        }, [grayscale, showWatermark, saveAsGif, watermark]);
-
-        const localPayload = React.useMemo(
-            () => buildLocalQuotePayload(message, {
-                grayscale,
-                showWatermark,
-                watermark,
-            }),
-            [message, grayscale, showWatermark, watermark],
-        );
-
-        const fallbackUrl = React.useMemo(
-            () => getQuoteUrl(message, {
-                grayscale,
-                showWatermark,
-                watermark,
-                saveAsGif,
-            }),
-            [message, grayscale, showWatermark, watermark, saveAsGif],
-        );
-
-        const rendererHtml = React.useMemo(
-            () => buildQuoteRendererHtml(localPayload),
-            [
-                localPayload.quote,
-                localPayload.displayName,
-                localPayload.username,
-                localPayload.avatarUrl,
-                localPayload.grayscale,
-                localPayload.showWatermark,
-                localPayload.watermark,
-            ],
-        );
-
-        React.useEffect(() => {
-            onPreviewState?.({
-                dataUrl: generatedDataUrl,
-                fallbackUrl,
-                options: {
-                    grayscale,
-                    showWatermark,
-                    saveAsGif,
-                    watermark,
-                },
-            });
-        }, [
-            onPreviewState,
-            generatedDataUrl,
-            fallbackUrl,
-            grayscale,
-            showWatermark,
-            saveAsGif,
-            watermark,
-        ]);
-
-        const onWebViewMessage = event => {
-            const data = event?.nativeEvent?.data;
-            if (typeof data !== "string") return;
-
-            let parsed = null;
-            try {
-                parsed = JSON.parse(data);
-            } catch {
-                return;
-            }
-
-            if (parsed?.type === "result" && typeof parsed.dataUrl === "string") {
-                setGeneratedDataUrl(parsed.dataUrl);
-                setRenderError("");
-            } else if (parsed?.type === "error") {
-                setRenderError(String(parsed.message || "Failed to render quote preview."));
-            }
-        };
-
-        const textStyle = {
-            color: "#fff",
-            fontSize: 15,
-        };
-
-        const toggleRow = (label, value, setValue, key) => React.createElement(
-            ReactNative.View,
-            {
-                key,
-                style: {
-                    marginTop: 10,
-                    flexDirection: "row",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                },
-            },
-            [
-                React.createElement(ReactNative.Text, { style: textStyle }, label),
-                ReactNative.Switch
-                    ? React.createElement(ReactNative.Switch, {
-                        value,
-                        onValueChange: setValue,
-                    })
-                    : React.createElement(
-                        ReactNative.Pressable,
-                        {
-                            onPress: () => setValue(!value),
-                            style: {
-                                borderWidth: 1,
-                                borderColor: "#666",
-                                borderRadius: 6,
-                                paddingHorizontal: 10,
-                                paddingVertical: 6,
-                            },
-                        },
-                        React.createElement(
-                            ReactNative.Text,
-                            { style: { color: "#fff", fontSize: 13 } },
-                            value ? "ON" : "OFF",
-                        ),
-                    ),
-            ],
-        );
-
-        const previewElement = WebView
-            ? React.createElement(WebView, {
-                key: "quoter-webview",
-                source: {
-                    html: rendererHtml,
-                    baseUrl: "https://localhost",
-                },
-                originWhitelist: ["*"],
-                javaScriptEnabled: true,
-                domStorageEnabled: true,
-                mixedContentMode: "always",
-                onMessage: onWebViewMessage,
-                style: {
-                    width: "100%",
-                    height: "100%",
-                    backgroundColor: "#000",
-                },
-            })
-            : React.createElement(ReactNative.Image, {
-                key: "quoter-preview-fallback",
-                source: { uri: fallbackUrl },
-                resizeMode: "cover",
-                style: {
-                    width: "100%",
-                    height: "100%",
-                    backgroundColor: "#111",
-                },
-            });
+        const height = Math.round(width * 0.56);
 
         return React.createElement(
-            ReactNative.ScrollView,
+            ReactNative.View,
             {
-                style: { maxHeight: 460 },
-                contentContainerStyle: { paddingTop: 10, paddingBottom: 4 },
+                style: {
+                    marginTop: 12,
+                    marginBottom: 4,
+                    alignItems: "center",
+                },
             },
             [
-                React.createElement(
-                    ReactNative.View,
-                    {
-                        key: "quoter-preview-wrap",
-                        style: {
-                            width: previewWidth,
-                            height: previewHeight,
-                            borderRadius: 14,
-                            overflow: "hidden",
-                            alignSelf: "center",
-                            backgroundColor: "#0f0f0f",
-                        },
+                React.createElement(ReactNative.Image, {
+                    key: "quote-preview-image",
+                    source: { uri: quoteUrl },
+                    resizeMode: "cover",
+                    style: {
+                        width,
+                        height,
+                        borderRadius: 12,
+                        backgroundColor: "#111",
                     },
-                    previewElement,
-                ),
+                }),
                 React.createElement(
                     ReactNative.Text,
                     {
-                        key: "quoter-preview-caption",
+                        key: "quote-preview-text",
                         style: {
                             color: "#aaa",
                             marginTop: 8,
-                            textAlign: "center",
                             fontSize: 12,
                         },
                     },
-                    "Catch Them In 4K.",
+                    "Preview generated from selected message",
                 ),
-                renderError
-                    ? React.createElement(
-                        ReactNative.Text,
-                        {
-                            key: "quoter-preview-error",
-                            style: {
-                                color: "#f66",
-                                marginTop: 8,
-                                textAlign: "center",
-                                fontSize: 12,
-                            },
-                        },
-                        renderError,
-                    )
-                    : null,
-                toggleRow("Grayscale", grayscale, setGrayscale, "gray"),
-                toggleRow("Save as GIF", saveAsGif, setSaveAsGif, "gif"),
-                React.createElement(
-                    ReactNative.Text,
-                    {
-                        key: "gif-hint",
-                        style: { color: "#888", marginTop: 4, fontSize: 12 },
-                    },
-                    "GIF output is API-dependent on mobile builds.",
-                ),
-                toggleRow("Show Watermark", showWatermark, setShowWatermark, "wm"),
-                showWatermark
-                    ? React.createElement(ReactNative.TextInput, {
-                        key: "watermark-input",
-                        value: watermark,
-                        onChangeText: setWatermark,
-                        placeholder: "Watermark text",
-                        placeholderTextColor: "#666",
-                        maxLength: 32,
-                        style: {
-                            color: "#fff",
-                            borderWidth: 1,
-                            borderColor: "#444",
-                            borderRadius: 8,
-                            paddingHorizontal: 12,
-                            paddingVertical: 10,
-                            marginTop: 10,
-                        },
-                    })
-                    : null,
             ],
         );
     }
@@ -748,61 +283,29 @@ draw();
     }
 
     function handleQuoteAction(message) {
-        let previewState = {
-            dataUrl: null,
-            fallbackUrl: getQuoteUrl(message),
-            options: {
-                grayscale: Boolean(storage.grayscale),
-                showWatermark: Boolean(storage.showWatermark),
-                saveAsGif: Boolean(storage.saveAsGif),
-                watermark: String(storage.watermark ?? API_DEFAULTS.watermark),
-            },
-        };
-
-        const preview = React.createElement(QuotePreviewCard, {
-            message,
-            onPreviewState: state => {
-                if (state && typeof state === "object") {
-                    previewState = {
-                        ...previewState,
-                        ...state,
-                    };
-                }
-            },
-        });
+        const quoteUrl = getQuoteUrl(message);
+        const preview = renderQuotePreview(quoteUrl);
 
         alerts.showConfirmationAlert({
             title: "Create Quote",
-            content: "Generate a quote card, then send it or copy fallback image link.",
+            content: "Send quote image link in chat or copy the image link.",
             children: preview,
             confirmText: "Send",
             cancelText: "Cancel",
             secondaryConfirmText: "Copy Link",
             onConfirm: () => {
-                void (async () => {
-                    try {
-                        if (previewState.dataUrl) {
-                            await sendGeneratedQuoteImage(message, previewState.dataUrl);
-                            showToast("Quote sent as image.");
-                            return;
-                        }
-
-                        const quoteUrl = previewState.fallbackUrl
-                            || getQuoteUrl(message, previewState.options);
-                        sendQuoteMessage(message, quoteUrl);
-                        showToast("Quote sent.");
-                    } catch (error) {
-                        const text = error instanceof Error ? error.message : String(error);
-                        showErrorToast(`Failed to send quote: ${text}`);
-                    }
-                })();
+                try {
+                    sendQuoteMessage(message, quoteUrl);
+                    showToast("Quote sent.");
+                } catch (error) {
+                    const text = error instanceof Error ? error.message : String(error);
+                    showErrorToast(`Failed to send quote: ${text}`);
+                }
             },
             onConfirmSecondary: () => {
                 try {
-                    const quoteUrl = previewState.fallbackUrl
-                        || getQuoteUrl(message, previewState.options);
                     clipboard.setString(quoteUrl);
-                    showToast("Fallback quote link copied.");
+                    showToast("Quote URL copied.");
                 } catch (error) {
                     const text = error instanceof Error ? error.message : String(error);
                     showErrorToast(`Failed to copy URL: ${text}`);
