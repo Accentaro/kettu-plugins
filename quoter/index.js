@@ -20,21 +20,36 @@
     const React = common.React;
     const ReactNative = common.ReactNative;
 
-    const actionSheetModule = metro.findByProps("openLazy", "hideActionSheet");
-    const messageActions = metro.findByProps("sendMessage", "revealMessage")
-        ?? metro.findByProps("sendMessage", "receiveMessage")
-        ?? metro.findByProps("sendMessage");
-    const avatarUtils = metro.findByProps("getUserAvatarURL", "getUserAvatarSource")
-        ?? metro.findByProps("getUserAvatarURL");
-    const uploadHandler = metro.findByProps("promptToUpload")
-        ?? metro.findByProps("promptToUpload", "showUploadDialog");
-    const channelStore = typeof metro.findByStoreName === "function"
-        ? metro.findByStoreName("ChannelStore")
-        : null;
-    const webViewModule = metro.find(module => module?.WebView && !module.default);
+    const safeGet = (factory, fallback = null) => {
+        try {
+            const value = factory?.();
+            return value ?? fallback;
+        } catch {
+            return fallback;
+        }
+    };
+
+    const globalRoot = typeof globalThis !== "undefined"
+        ? globalThis
+        : (typeof global !== "undefined" ? global : (typeof window !== "undefined" ? window : {}));
+
+    const actionSheetModule = safeGet(() => metro.findByProps("openLazy", "hideActionSheet"));
+    const messageActions = safeGet(() => metro.findByProps("sendMessage", "revealMessage"))
+        ?? safeGet(() => metro.findByProps("sendMessage", "receiveMessage"))
+        ?? safeGet(() => metro.findByProps("sendMessage"));
+    const avatarUtils = safeGet(() => metro.findByProps("getUserAvatarURL", "getUserAvatarSource"))
+        ?? safeGet(() => metro.findByProps("getUserAvatarURL"));
+    const uploadHandler = safeGet(() => metro.findByProps("promptToUpload"))
+        ?? safeGet(() => metro.findByProps("promptToUpload", "showUploadDialog"));
+    const channelStore = safeGet(
+        () => (typeof metro.findByStoreName === "function" ? metro.findByStoreName("ChannelStore") : null),
+        null,
+    );
+    const webViewModule = safeGet(() => metro.findByProps("WebView"))
+        ?? safeGet(() => metro.find(module => module && module.WebView && !module.default));
     const WebView = webViewModule?.WebView ?? null;
-    const nativeFileModule = globalThis?.nativeModuleProxy?.NativeFileModule
-        ?? globalThis?.nativeModuleProxy?.DCDFileManager
+    const nativeFileModule = globalRoot?.nativeModuleProxy?.NativeFileModule
+        ?? globalRoot?.nativeModuleProxy?.DCDFileManager
         ?? null;
     const clipboard = common.clipboard;
 
