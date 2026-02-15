@@ -367,25 +367,26 @@ render().catch(error => {
         storage.watermark = String(options.watermark ?? "");
     }
 
-    async function sendGeneratedImage(message, dataUrl) {
+    function sendGeneratedImage(message, dataUrl) {
         if (!UploadHandler || typeof UploadHandler.promptToUpload !== "function") {
-            throw new Error("Upload handler unavailable on this build.");
+            return Promise.reject(new Error("Upload handler unavailable on this build."));
         }
 
         const channelId = getMessageChannelId(message);
-        if (!channelId) throw new Error("Unable to resolve message channel.");
-
-        const response = await fetch(dataUrl);
-        if (!response.ok) throw new Error("Failed to build quote image payload.");
-        const blob = await response.blob();
+        if (!channelId) return Promise.reject(new Error("Unable to resolve message channel."));
 
         if (typeof File !== "function") {
-            throw new Error("File constructor unavailable on this build.");
+            return Promise.reject(new Error("File constructor unavailable on this build."));
         }
 
-        const channel = ChannelStore?.getChannel?.(channelId) ?? { id: channelId };
-        const file = new File([blob], buildFileName(message), { type: "image/png" });
-        UploadHandler.promptToUpload([file], channel, 0);
+        return fetch(dataUrl).then(response => {
+            if (!response.ok) throw new Error("Failed to build quote image payload.");
+            return response.blob();
+        }).then(blob => {
+            const channel = ChannelStore?.getChannel?.(channelId) ?? { id: channelId };
+            const file = new File([blob], buildFileName(message), { type: "image/png" });
+            UploadHandler.promptToUpload([file], channel, 0);
+        });
     }
 
     function QuotePreviewCard({ message, onStateChange }) {
@@ -651,16 +652,17 @@ render().catch(error => {
             cancelText: "Cancel",
             secondaryConfirmText: "Copy Link",
             onConfirm: () => {
-                void (async () => {
-                    try {
-                        if (!modalState.dataUrl) throw new Error("Quote image is not ready yet.");
-                        await sendGeneratedImage(message, modalState.dataUrl);
-                        toast("Quote sent as image.");
-                    } catch (error) {
-                        const msg = error instanceof Error ? error.message : String(error);
-                        errorToast(`Failed to send quote: ${msg}`);
-                    }
-                })();
+                if (!modalState.dataUrl) {
+                    errorToast("Failed to send quote: Quote image is not ready yet.");
+                    return;
+                }
+
+                sendGeneratedImage(message, modalState.dataUrl).then(() => {
+                    toast("Quote sent as image.");
+                }).catch(error => {
+                    const msg = error instanceof Error ? error.message : String(error);
+                    errorToast(`Failed to send quote: ${msg}`);
+                });
             },
             onConfirmSecondary: () => {
                 try {
