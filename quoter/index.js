@@ -19,6 +19,7 @@
     const { showConfirmationAlert } = vendetta.ui.alerts;
     const { showToast } = vendetta.ui.toasts;
     const { getAssetIDByName } = vendetta.ui.assets;
+    const logger = vendetta.logger ?? console;
 
     const LazyActionSheet = metro.findByProps("openLazy", "hideActionSheet");
     const UserStore = typeof metro.findByStoreName === "function"
@@ -66,6 +67,18 @@
         "showLargeMessageDialog",
         "canUploadLongMessages",
         "promptToUpload",
+    ];
+
+    const UPLOAD_KEY_HINTS = [
+        "upload",
+        "attach",
+        "attachment",
+        "draft",
+        "file",
+        "media",
+        "prompt",
+        "large",
+        "picker",
     ];
 
     function ensureDefaults() {
@@ -392,12 +405,38 @@ render().catch(error => {
             ?? safeFind(() => metro.findByProps("getChannel"));
     }
 
-    let cachedPromptToUpload = null;
-    let cachedPromptToUploadSource = "unknown";
+    let cachedUploadCandidates = null;
     let lastUploadLookupDiagnostics = "lookup not run";
 
     function normalizeLower(value) {
         return String(value || "").toLowerCase();
+    }
+
+    function logDebug(message, data) {
+        const suffix = data === undefined ? "" : ` ${typeof data === "string" ? data : JSON.stringify(data)}`;
+        try {
+            logger?.log?.(`[${MODULE_TAG}] ${message}${suffix}`);
+        } catch { }
+        try {
+            console.log(`[${MODULE_TAG}] ${message}${suffix}`);
+        } catch { }
+    }
+
+    function logError(message, error) {
+        const detail = error instanceof Error ? (error.stack || error.message) : String(error);
+        try {
+            logger?.error?.(`[${MODULE_TAG}] ${message}: ${detail}`);
+        } catch { }
+        try {
+            console.error(`[${MODULE_TAG}] ${message}: ${detail}`);
+        } catch { }
+    }
+
+    function includesAny(value, list) {
+        for (const item of list) {
+            if (value.includes(item)) return true;
+        }
+        return false;
     }
 
     function functionContainsUploadSignature(fn) {
@@ -410,20 +449,56 @@ render().catch(error => {
         }
     }
 
+    function collectPropertyNames(value, maxProtoDepth = 2) {
+        const keys = new Set();
+        let current = value;
+        let depth = 0;
+
+        while (current && depth <= maxProtoDepth) {
+            try {
+                for (const key of Object.getOwnPropertyNames(current)) keys.add(key);
+            } catch { }
+            current = Object.getPrototypeOf(current);
+            depth++;
+        }
+
+        return Array.from(keys);
+    }
+
+    function keyLooksUploadRelated(key) {
+        const keyLower = normalizeLower(key);
+        return includesAny(keyLower, UPLOAD_KEY_HINTS);
+    }
+
+    function scoreUploadFunction(key, fn) {
+        const keyLower = normalizeLower(key);
+        let score = 0;
+
+        if (key === "promptToUpload") score += 200;
+        if (keyLower.includes("prompt")) score += 60;
+        if (keyLower.includes("upload")) score += 60;
+        if (keyLower.includes("attachment")) score += 30;
+        if (keyLower.includes("file")) score += 20;
+        if (functionContainsUploadSignature(fn)) score += 120;
+        if (typeof fn.length === "number" && fn.length >= 1 && fn.length <= 5) score += 10;
+
+        return score;
+    }
+
     function getPromptCandidateFromObject(root) {
         if (!root || (typeof root !== "object" && typeof root !== "function")) return null;
 
         if (typeof root === "function") {
             const fnName = normalizeLower(root.name);
             if (fnName === "prompttoupload" || functionContainsUploadSignature(root)) {
-                return { fn: root, ctx: null, key: root.name || "<function>" };
+                return { fn: root, ctx: null, key: root.name || "<function>", score: scoreUploadFunction(root.name || "<function>", root) };
             }
         }
 
         for (const name of UPLOAD_METHOD_NAMES) {
             try {
                 const fn = root?.[name];
-                if (typeof fn === "function") return { fn, ctx: root, key: name };
+                if (typeof fn === "function") return { fn, ctx: root, key: name, score: scoreUploadFunction(name, fn) };
             } catch { }
         }
 
@@ -438,10 +513,7 @@ render().catch(error => {
             if (seen.has(value)) continue;
             seen.add(value);
 
-            let keys = [];
-            try {
-                keys = Object.getOwnPropertyNames(value);
-            } catch { }
+            const keys = collectPropertyNames(value, 1);
 
             for (const key of keys.slice(0, 180)) {
                 let child;
@@ -452,13 +524,9 @@ render().catch(error => {
                 }
 
                 if (typeof child === "function") {
-                    const keyLower = normalizeLower(key);
-                    const uploadNameHint = keyLower.includes("upload")
-                        || keyLower.includes("large")
-                        || keyLower.includes("prompt");
-
+                    const uploadNameHint = keyLooksUploadRelated(key);
                     if (key === "promptToUpload" || (uploadNameHint && functionContainsUploadSignature(child)) || functionContainsUploadSignature(child)) {
-                        return { fn: child, ctx: value, key };
+                        return { fn: child, ctx: value, key, score: scoreUploadFunction(key, child) };
                     }
                 } else if ((typeof child === "object" || typeof child === "function") && child && depth < 3) {
                     queue.push({ value: child, depth: depth + 1 });
@@ -495,32 +563,79 @@ render().catch(error => {
     function hasUploadKeyHints(value) {
         if (!value || (typeof value !== "object" && typeof value !== "function")) return false;
         if (typeof value === "function") {
-            return functionContainsUploadSignature(value) || normalizeLower(value.name).includes("upload");
+            return functionContainsUploadSignature(value) || keyLooksUploadRelated(value.name);
         }
 
-        let keys = [];
-        try {
-            keys = Object.getOwnPropertyNames(value);
-        } catch {
-            return false;
-        }
+        const keys = collectPropertyNames(value, 1);
 
         for (const key of keys.slice(0, 80)) {
-            const keyLower = normalizeLower(key);
             if (UPLOAD_METHOD_NAMES.includes(key)) return true;
-            if (keyLower.includes("upload") || keyLower.includes("draft") || keyLower.includes("large")) return true;
+            if (keyLooksUploadRelated(key)) return true;
         }
 
         return false;
     }
 
-    function bindPromptCandidate(candidate, sourceLabel) {
-        if (!candidate || typeof candidate.fn !== "function") return null;
-        cachedPromptToUploadSource = sourceLabel || "unknown";
-        cachedPromptToUpload = function () {
-            return candidate.fn.apply(candidate.ctx ?? null, arguments);
+    function createUploadCandidate(fn, ctx, key, sourceLabel) {
+        return {
+            fn,
+            ctx: ctx ?? null,
+            key: key || "<unknown>",
+            source: sourceLabel || "unknown",
+            score: scoreUploadFunction(key || "<unknown>", fn),
         };
-        return cachedPromptToUpload;
+    }
+
+    function pushUploadCandidate(target, seen, candidate) {
+        if (!candidate || typeof candidate.fn !== "function") return;
+        if (seen.has(candidate.fn)) return;
+        seen.add(candidate.fn);
+        target.push(candidate);
+    }
+
+    function collectUploadFunctionsFromObject(root, sourceLabel, maxNodes = 280) {
+        const out = [];
+        const seenFns = new Set();
+        if (!root || (typeof root !== "object" && typeof root !== "function")) return out;
+
+        const queue = [{ value: root, depth: 0 }];
+        const seenNodes = new Set();
+        let scanned = 0;
+
+        while (queue.length && scanned < maxNodes) {
+            scanned++;
+            const { value, depth } = queue.shift();
+            if (!value || (typeof value !== "object" && typeof value !== "function")) continue;
+            if (seenNodes.has(value)) continue;
+            seenNodes.add(value);
+
+            if (typeof value === "function") {
+                const fnName = value.name || "<function>";
+                if (keyLooksUploadRelated(fnName) || functionContainsUploadSignature(value)) {
+                    pushUploadCandidate(out, seenFns, createUploadCandidate(value, null, fnName, sourceLabel));
+                }
+            }
+
+            const keys = collectPropertyNames(value, 1);
+            for (const key of keys.slice(0, 220)) {
+                let child;
+                try {
+                    child = value[key];
+                } catch {
+                    continue;
+                }
+
+                if (typeof child === "function") {
+                    if (keyLooksUploadRelated(key) || key === "promptToUpload" || functionContainsUploadSignature(child)) {
+                        pushUploadCandidate(out, seenFns, createUploadCandidate(child, value, key, sourceLabel));
+                    }
+                } else if ((typeof child === "object" || typeof child === "function") && child && depth < 3) {
+                    queue.push({ value: child, depth: depth + 1 });
+                }
+            }
+        }
+
+        return out;
     }
 
     function getMetroLookupCandidates() {
@@ -547,34 +662,51 @@ render().catch(error => {
         return candidates;
     }
 
-    function getUploadPromptToUpload() {
-        if (typeof cachedPromptToUpload === "function") return cachedPromptToUpload;
+    function buildUploadFunctionCandidates() {
+        if (Array.isArray(cachedUploadCandidates)) return cachedUploadCandidates;
         lastUploadLookupDiagnostics = "lookup started";
+        const uploadCandidates = [];
+        const seenFns = new Set();
 
         const directCandidates = getMetroLookupCandidates();
         for (const candidate of directCandidates) {
             const match = getPromptCandidateFromObject(candidate.value);
             if (match?.fn) {
-                return bindPromptCandidate(match, candidate.label);
+                pushUploadCandidate(uploadCandidates, seenFns, {
+                    ...createUploadCandidate(match.fn, match.ctx, match.key, candidate.label),
+                    score: (match.score || 0) + 300,
+                });
             }
+
+            const discovered = collectUploadFunctionsFromObject(candidate.value, candidate.label, 200);
+            for (const item of discovered) pushUploadCandidate(uploadCandidates, seenFns, item);
         }
 
         const moduleEntries = getMetroModuleEntries();
         let initializedWithHints = 0;
+        let initializedScanned = 0;
         for (const [id, entry] of moduleEntries) {
             const exports = getInitializedModuleExports(entry);
             if (!exports || !hasUploadKeyHints(exports)) continue;
             initializedWithHints++;
+            initializedScanned++;
 
-            const match = getPromptCandidateFromObject(exports)
-                ?? getPromptCandidateFromObject(exports?.default);
+            const label = `initialized-module:${id}`;
+            const match = getPromptCandidateFromObject(exports) ?? getPromptCandidateFromObject(exports?.default);
             if (match?.fn) {
-                return bindPromptCandidate(match, `initialized-module:${id}`);
+                pushUploadCandidate(uploadCandidates, seenFns, {
+                    ...createUploadCandidate(match.fn, match.ctx, match.key, label),
+                    score: (match.score || 0) + 220,
+                });
             }
+
+            const discovered = collectUploadFunctionsFromObject(exports, label, 160);
+            for (const item of discovered) pushUploadCandidate(uploadCandidates, seenFns, item);
         }
 
         const metroRequire = typeof globalThis?.__r === "function" ? globalThis.__r : null;
         let requiredCandidateCount = 0;
+        let requiredScanned = 0;
         if (metroRequire) {
             const candidateIds = [];
 
@@ -596,22 +728,98 @@ render().catch(error => {
                 } catch {
                     continue;
                 }
+                requiredScanned++;
 
-                const match = getPromptCandidateFromObject(exports)
-                    ?? getPromptCandidateFromObject(exports?.default);
+                const label = `required-module:${id}`;
+                const match = getPromptCandidateFromObject(exports) ?? getPromptCandidateFromObject(exports?.default);
                 if (match?.fn) {
-                    return bindPromptCandidate(match, `required-module:${id}`);
+                    pushUploadCandidate(uploadCandidates, seenFns, {
+                        ...createUploadCandidate(match.fn, match.ctx, match.key, label),
+                        score: (match.score || 0) + 260,
+                    });
                 }
+
+                const discovered = collectUploadFunctionsFromObject(exports, label, 160);
+                for (const item of discovered) pushUploadCandidate(uploadCandidates, seenFns, item);
             }
         }
+
+        uploadCandidates.sort((a, b) => b.score - a.score);
+        cachedUploadCandidates = uploadCandidates;
+
+        const top = uploadCandidates.slice(0, 5).map(candidate =>
+            `${candidate.key}@${candidate.source}[${candidate.score}]`,
+        );
 
         lastUploadLookupDiagnostics = [
             `directCandidates=${directCandidates.length}`,
             `initializedHintedModules=${initializedWithHints}`,
             `requiredFactoryCandidates=${requiredCandidateCount}`,
+            `uploadFns=${uploadCandidates.length}`,
+            `initializedScanned=${initializedScanned}`,
+            `requiredScanned=${requiredScanned}`,
+            `top=${top.join(",") || "none"}`,
         ].join(", ");
 
-        return null;
+        logDebug("Upload lookup diagnostics", lastUploadLookupDiagnostics);
+        return uploadCandidates;
+    }
+
+    function invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType) {
+        const fn = candidate?.fn;
+        if (typeof fn !== "function") return Promise.reject(new Error("Invalid upload candidate."));
+
+        const call = function () {
+            return fn.apply(candidate.ctx ?? null, arguments);
+        };
+        const attempts = [
+            () => call([uploadable], channel, 0),
+            () => call([uploadable], channel, draftType),
+            () => call([uploadable], channel),
+            () => call([uploadable], channelId, 0),
+            () => call([uploadable], channelId, draftType),
+            () => call([uploadable], channelId),
+            () => call(channel, [uploadable], draftType),
+            () => call(channelId, [uploadable], draftType),
+            () => call({
+                channel,
+                channelId,
+                files: [uploadable],
+                uploads: [uploadable],
+                draftType,
+            }),
+            () => call({
+                channel,
+                files: [uploadable],
+                draftType,
+            }),
+        ];
+
+        let lastError = null;
+        return new Promise((resolve, reject) => {
+            const runAttempt = index => {
+                if (index >= attempts.length) {
+                    reject(lastError instanceof Error ? lastError : new Error("All upload call signatures failed."));
+                    return;
+                }
+
+                let result;
+                try {
+                    result = attempts[index]();
+                } catch (error) {
+                    lastError = error;
+                    runAttempt(index + 1);
+                    return;
+                }
+
+                Promise.resolve(result).then(resolve).catch(error => {
+                    lastError = error;
+                    runAttempt(index + 1);
+                });
+            };
+
+            runAttempt(0);
+        });
     }
 
     function getChannelMessageDraftType() {
@@ -668,8 +876,8 @@ render().catch(error => {
     }
 
     function sendGeneratedImage(message, dataUrl) {
-        const promptToUpload = getUploadPromptToUpload();
-        if (typeof promptToUpload !== "function") {
+        const uploadCandidates = buildUploadFunctionCandidates();
+        if (!uploadCandidates.length) {
             return Promise.reject(new Error(`Upload handler unavailable on this build. ${lastUploadLookupDiagnostics}`));
         }
 
@@ -696,36 +904,36 @@ render().catch(error => {
             });
 
         const draftType = getChannelMessageDraftType();
-        const attempts = [
-            () => promptToUpload([uploadable], channel, 0),
-            () => promptToUpload([uploadable], channel, draftType),
-            () => promptToUpload([uploadable], channel),
-            () => promptToUpload([uploadable], channelId, 0),
-            () => promptToUpload([uploadable], channelId, draftType),
-            () => promptToUpload([uploadable], channelId),
-            () => promptToUpload(channel, [uploadable], draftType),
-            () => promptToUpload(channelId, [uploadable], draftType),
-            () => promptToUpload({
-                channel,
-                channelId,
-                files: [uploadable],
-                uploads: [uploadable],
-                draftType,
-            }),
-        ];
+        const strongCandidates = uploadCandidates.filter(candidate => candidate.score >= 80);
+        const rankedCandidates = (strongCandidates.length ? strongCandidates : uploadCandidates).slice(0, 18);
+        logDebug("Send quote using upload candidates", rankedCandidates.map(c => `${c.key}@${c.source}[${c.score}]`).join(", "));
 
-        let lastError = null;
-        for (const attempt of attempts) {
-            try {
-                return Promise.resolve(attempt());
-            } catch (error) {
-                lastError = error;
-            }
-        }
+        return new Promise((resolve, reject) => {
+            let index = 0;
+            let lastError = null;
 
-        return Promise.reject(lastError instanceof Error
-            ? lastError
-            : new Error(`Upload handler invocation failed on this build (${cachedPromptToUploadSource}).`));
+            const run = () => {
+                if (index >= rankedCandidates.length) {
+                    const fallbackError = lastError instanceof Error
+                        ? lastError
+                        : new Error("Upload handler invocation failed for all candidates.");
+                    logError(`Upload failed after ${rankedCandidates.length} candidates`, fallbackError);
+                    reject(new Error(`${fallbackError.message}. ${lastUploadLookupDiagnostics}`));
+                    return;
+                }
+
+                const candidate = rankedCandidates[index++];
+                invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType).then(() => {
+                    logDebug("Upload candidate succeeded", `${candidate.key}@${candidate.source}[${candidate.score}]`);
+                    resolve();
+                }).catch(error => {
+                    lastError = error;
+                    run();
+                });
+            };
+
+            run();
+        });
     }
 
     function QuotePreviewCard({ message, onStateChange }) {
