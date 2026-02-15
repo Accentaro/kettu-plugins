@@ -67,6 +67,10 @@
         "showLargeMessageDialog",
         "canUploadLongMessages",
         "promptToUpload",
+        "MESSAGE_CREATE_ATTACHMENT_UPLOAD",
+        "MESSAGE_DELETE_UPLOAD",
+        "uploadAttachment",
+        "uploads",
     ];
 
     const UPLOAD_KEY_HINTS = [
@@ -481,6 +485,7 @@ render().catch(error => {
         if (keyLower.includes("file")) score += 20;
         if (functionContainsUploadSignature(fn)) score += 120;
         if (typeof fn.length === "number" && fn.length >= 1 && fn.length <= 5) score += 10;
+        if (/^[A-Z0-9_]+$/.test(String(key)) && String(key).includes("_")) score -= 45;
 
         return score;
     }
@@ -662,8 +667,21 @@ render().catch(error => {
         return candidates;
     }
 
-    function buildUploadFunctionCandidates() {
-        if (Array.isArray(cachedUploadCandidates)) return cachedUploadCandidates;
+    function getFactoryHintScore(factorySource) {
+        if (!factorySource) return 0;
+        const src = normalizeLower(factorySource);
+        let score = 0;
+        for (const hint of UPLOAD_KEY_HINTS) {
+            if (src.includes(hint)) score += 1;
+        }
+        for (const signature of UPLOAD_SIGNATURES) {
+            if (factorySource.includes(signature)) score += 3;
+        }
+        return score;
+    }
+
+    function buildUploadFunctionCandidates(force = false) {
+        if (!force && Array.isArray(cachedUploadCandidates)) return cachedUploadCandidates;
         lastUploadLookupDiagnostics = "lookup started";
         const uploadCandidates = [];
         const seenFns = new Set();
@@ -715,13 +733,17 @@ render().catch(error => {
                 const source = getFactorySource(entry.factory);
                 if (!source) continue;
 
-                if (UPLOAD_SIGNATURES.some(signature => source.includes(signature))) {
-                    candidateIds.push(id);
+                const hintScore = getFactoryHintScore(source);
+                if (hintScore > 0) {
+                    candidateIds.push({ id, hintScore });
                 }
             }
 
-            for (const id of candidateIds.slice(0, 80)) {
-                requiredCandidateCount++;
+            candidateIds.sort((a, b) => b.hintScore - a.hintScore);
+            requiredCandidateCount = candidateIds.length;
+
+            for (const candidateMeta of candidateIds.slice(0, 220)) {
+                const id = candidateMeta.id;
                 let exports;
                 try {
                     exports = metroRequire(Number(id));
@@ -735,7 +757,7 @@ render().catch(error => {
                 if (match?.fn) {
                     pushUploadCandidate(uploadCandidates, seenFns, {
                         ...createUploadCandidate(match.fn, match.ctx, match.key, label),
-                        score: (match.score || 0) + 260,
+                        score: (match.score || 0) + 260 + (candidateMeta.hintScore || 0),
                     });
                 }
 
@@ -765,7 +787,7 @@ render().catch(error => {
         return uploadCandidates;
     }
 
-    function invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType) {
+    function invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType, fileName) {
         const fn = candidate?.fn;
         if (typeof fn !== "function") return Promise.reject(new Error("Invalid upload candidate."));
 
@@ -795,6 +817,9 @@ render().catch(error => {
             }),
         ];
 
+        const beforeUploads = getUploadsForChannel(channelId, draftType).length;
+        const hasStore = Boolean(getUploadAttachmentStore());
+
         let lastError = null;
         return new Promise((resolve, reject) => {
             const runAttempt = index => {
@@ -812,7 +837,29 @@ render().catch(error => {
                     return;
                 }
 
-                Promise.resolve(result).then(resolve).catch(error => {
+                Promise.resolve(result).then(() => {
+                    if (!hasStore) {
+                        resolve();
+                        return;
+                    }
+
+                    Promise.resolve()
+                        .then(() => waitMs(80))
+                        .then(() => {
+                            const afterUploads = getUploadsForChannel(channelId, draftType).length;
+                            const fileFound = hasUploadForFile(channelId, fileName, draftType);
+                            if (fileFound || afterUploads > beforeUploads) {
+                                resolve();
+                                return;
+                            }
+
+                            throw new Error("No upload entry was created.");
+                        })
+                        .catch(error => {
+                            lastError = error;
+                            runAttempt(index + 1);
+                        });
+                }).catch(error => {
                     lastError = error;
                     runAttempt(index + 1);
                 });
@@ -875,8 +922,53 @@ render().catch(error => {
         return null;
     }
 
+    function getUploadAttachmentStore() {
+        return safeFind(() => (typeof metro.findByStoreName === "function" ? metro.findByStoreName("UploadAttachmentStore") : null));
+    }
+
+    function getUploadsForChannel(channelId, draftType = 0) {
+        const store = getUploadAttachmentStore();
+        if (!store || typeof store.getUploads !== "function") return [];
+
+        let uploads = [];
+        try {
+            uploads = store.getUploads(channelId, draftType);
+        } catch {
+            try {
+                uploads = store.getUploads(channelId);
+            } catch {
+                uploads = [];
+            }
+        }
+
+        return Array.isArray(uploads) ? uploads : [];
+    }
+
+    function hasUploadForFile(channelId, fileName, draftType = 0) {
+        if (!channelId || !fileName) return false;
+
+        const uploads = getUploadsForChannel(channelId, draftType);
+        for (const upload of uploads) {
+            if (!upload || typeof upload !== "object") continue;
+            if (upload.filename === fileName || upload.name === fileName) return true;
+
+            const item = upload.item;
+            if (item && typeof item === "object") {
+                if (item.fileName === fileName || item.filename === fileName || item.name === fileName) return true;
+                const uri = String(item.uri || "");
+                if (uri.endsWith(`/${fileName}`)) return true;
+            }
+        }
+
+        return false;
+    }
+
+    function waitMs(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
     function sendGeneratedImage(message, dataUrl) {
-        const uploadCandidates = buildUploadFunctionCandidates();
+        const uploadCandidates = buildUploadFunctionCandidates(true);
         if (!uploadCandidates.length) {
             return Promise.reject(new Error(`Upload handler unavailable on this build. ${lastUploadLookupDiagnostics}`));
         }
@@ -904,13 +996,13 @@ render().catch(error => {
             });
 
         const draftType = getChannelMessageDraftType();
-        const strongCandidates = uploadCandidates.filter(candidate => candidate.score >= 80);
-        const rankedCandidates = (strongCandidates.length ? strongCandidates : uploadCandidates).slice(0, 18);
+        const rankedCandidates = uploadCandidates.slice(0, 90);
         logDebug("Send quote using upload candidates", rankedCandidates.map(c => `${c.key}@${c.source}[${c.score}]`).join(", "));
 
         return new Promise((resolve, reject) => {
             let index = 0;
             let lastError = null;
+            const shortErrors = [];
 
             const run = () => {
                 if (index >= rankedCandidates.length) {
@@ -918,16 +1010,20 @@ render().catch(error => {
                         ? lastError
                         : new Error("Upload handler invocation failed for all candidates.");
                     logError(`Upload failed after ${rankedCandidates.length} candidates`, fallbackError);
-                    reject(new Error(`${fallbackError.message}. ${lastUploadLookupDiagnostics}`));
+                    const details = shortErrors.length ? ` last=${shortErrors.join(" | ")}` : "";
+                    cachedUploadCandidates = null;
+                    reject(new Error(`${fallbackError.message}.${details} ${lastUploadLookupDiagnostics}`));
                     return;
                 }
 
                 const candidate = rankedCandidates[index++];
-                invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType).then(() => {
+                invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType, fileName).then(() => {
                     logDebug("Upload candidate succeeded", `${candidate.key}@${candidate.source}[${candidate.score}]`);
                     resolve();
                 }).catch(error => {
                     lastError = error;
+                    const msg = error instanceof Error ? error.message : String(error);
+                    if (shortErrors.length < 5) shortErrors.push(`${candidate.key}:${msg}`);
                     run();
                 });
             };
