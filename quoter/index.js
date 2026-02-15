@@ -21,6 +21,7 @@
     const ReactNative = common.ReactNative;
 
     const actionSheetModule = metro.findByProps("showSimpleActionSheet");
+    const contextMenuModule = metro.findByProps("ContextMenu", "hideContextMenu");
     const messageUtil = common.messageUtil;
     const clipboard = common.clipboard;
 
@@ -132,8 +133,11 @@
             config.messageRecord,
             config?.payload?.message,
             config?.args?.message,
+            config?.args?.[0]?.message,
             config?.messageItem?.message,
             config?.messageContext?.message,
+            config?.target?.message,
+            config?.payload?.targetMessage,
         ];
 
         for (const candidate of candidates) {
@@ -142,7 +146,95 @@
             }
         }
 
+        return deepFindMessage(config);
+    }
+
+    function looksLikeMessage(value) {
+        if (!value || typeof value !== "object") return false;
+        if (value.content == null) return false;
+        return (
+            value.author != null
+            || value.channel_id != null
+            || value.channelId != null
+            || value.timestamp != null
+            || value.id != null
+        );
+    }
+
+    function deepFindMessage(root) {
+        const stack = [root];
+        const seen = new Set();
+
+        while (stack.length) {
+            const current = stack.pop();
+            if (!current || typeof current !== "object") continue;
+            if (seen.has(current)) continue;
+            seen.add(current);
+
+            if (looksLikeMessage(current)) return current;
+
+            if (Array.isArray(current)) {
+                for (const item of current) {
+                    stack.push(item);
+                }
+                continue;
+            }
+
+            for (const value of Object.values(current)) {
+                if (value && typeof value === "object") {
+                    stack.push(value);
+                }
+            }
+        }
+
         return null;
+    }
+
+    function createQuoteActionItem(message) {
+        return {
+            id: "kettu-quoter",
+            label: "Quote",
+            action: () => handleQuoteAction(message),
+            onPress: () => handleQuoteAction(message),
+        };
+    }
+
+    function hasQuoteOption(items) {
+        return items.some(
+            item => item?.id === "kettu-quoter" || item?.label === "Quote",
+        );
+    }
+
+    function injectIntoList(list, message) {
+        if (!Array.isArray(list)) return false;
+        if (hasQuoteOption(list)) return false;
+
+        list.push(createQuoteActionItem(message));
+        return true;
+    }
+
+    function injectIntoNestedList(list, message) {
+        if (!Array.isArray(list)) return false;
+
+        if (list.length > 0 && Array.isArray(list[0])) {
+            const firstGroup = list[0];
+            if (!Array.isArray(firstGroup)) return false;
+            if (hasQuoteOption(firstGroup)) return false;
+            firstGroup.push(createQuoteActionItem(message));
+            return true;
+        }
+
+        return injectIntoList(list, message);
+    }
+
+    function injectQuoteAction(target, message) {
+        if (!target || typeof target !== "object") return false;
+
+        if (injectIntoNestedList(target.options, message)) return true;
+        if (injectIntoNestedList(target.items, message)) return true;
+        if (injectIntoNestedList(target.rows, message)) return true;
+
+        return false;
     }
 
     function handleQuoteAction(message) {
@@ -176,34 +268,45 @@
     }
 
     function patchMessageContextMenu() {
-        if (!actionSheetModule || typeof actionSheetModule.showSimpleActionSheet !== "function") {
-            vendetta.logger.error(`[${MODULE_TAG}] showSimpleActionSheet module not found.`);
-            return;
+        if (actionSheetModule && typeof actionSheetModule.showSimpleActionSheet === "function") {
+            const unpatchActionSheet = vendetta.patcher.after(
+                "showSimpleActionSheet",
+                actionSheetModule,
+                args => {
+                    const config = args?.[0];
+                    if (!config || typeof config !== "object") return;
+
+                    const message = extractMessage(config);
+                    if (!message || !normalizeText(message.content)) return;
+
+                    injectQuoteAction(config, message);
+                },
+            );
+
+            patches.push(unpatchActionSheet);
+        } else {
+            vendetta.logger.warn(`[${MODULE_TAG}] showSimpleActionSheet module not found.`);
         }
 
-        const unpatch = vendetta.patcher.after(
-            "showSimpleActionSheet",
-            actionSheetModule,
-            args => {
-                const config = args?.[0];
-                if (!config || !Array.isArray(config.options)) return;
+        if (contextMenuModule && typeof contextMenuModule.ContextMenu === "function") {
+            const unpatchContextMenu = vendetta.patcher.before(
+                "ContextMenu",
+                contextMenuModule,
+                args => {
+                    const props = args?.[0];
+                    if (!props || typeof props !== "object") return;
 
-                const message = extractMessage(config);
-                if (!message || !normalizeText(message.content)) return;
+                    const message = extractMessage(props);
+                    if (!message || !normalizeText(message.content)) return;
 
-                if (config.options.some(o => o?.id === "kettu-quoter" || o?.label === "Quote")) {
-                    return;
-                }
+                    injectQuoteAction(props, message);
+                },
+            );
 
-                config.options.push({
-                    id: "kettu-quoter",
-                    label: "Quote",
-                    onPress: () => handleQuoteAction(message),
-                });
-            },
-        );
-
-        patches.push(unpatch);
+            patches.push(unpatchContextMenu);
+        } else {
+            vendetta.logger.warn(`[${MODULE_TAG}] ContextMenu module not found.`);
+        }
     }
 
     function SettingsPanel() {
