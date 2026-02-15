@@ -1,69 +1,76 @@
 (() => {
     const MODULE_TAG = "KettuQuoter";
 
-    const API_DEFAULTS = {
-        endpoint: "https://api.popcat.xyz/quote",
+    const DEFAULTS = {
         grayscale: true,
         showWatermark: false,
-        saveAsGif: false,
         watermark: "Made with Kettu",
     };
 
     const storage = vendetta?.plugin?.storage ?? {};
     const patches = [];
 
-    const assets = vendetta.ui.assets;
-    const uiToasts = vendetta.ui.toasts;
-    const alerts = vendetta.ui.alerts;
     const metro = vendetta.metro;
-    const common = vendetta.metro.common;
+    const common = metro.common;
     const React = common.React;
     const ReactNative = common.ReactNative;
-
-    const actionSheetModule = metro.findByProps("openLazy", "hideActionSheet");
-    const messageActions = metro.findByProps("sendMessage", "revealMessage")
-        ?? metro.findByProps("sendMessage", "receiveMessage")
-        ?? metro.findByProps("sendMessage");
-    const avatarUtils = metro.findByProps("getUserAvatarURL", "getUserAvatarSource")
-        ?? metro.findByProps("getUserAvatarURL");
     const clipboard = common.clipboard;
 
+    const { findInReactTree } = vendetta.utils;
+    const { showConfirmationAlert } = vendetta.ui.alerts;
+    const { showToast } = vendetta.ui.toasts;
+    const { getAssetIDByName } = vendetta.ui.assets;
+
+    const LazyActionSheet = metro.findByProps("openLazy", "hideActionSheet");
+    const UploadHandler = metro.findByProps("promptToUpload");
+    const ChannelStore = metro.findByProps("getChannel", "getDMFromUserId")
+        ?? (typeof metro.findByStoreName === "function" ? metro.findByStoreName("ChannelStore") : null);
+    const UserStore = typeof metro.findByStoreName === "function"
+        ? metro.findByStoreName("UserStore")
+        : null;
+    const AvatarUtils = metro.findByProps("getUserAvatarURL");
+    const WebView = metro.find(module => module?.WebView && !module?.default)?.WebView ?? null;
+
+    const CANVAS_CONFIG = {
+        width: 1200,
+        height: 600,
+        quoteAreaWidth: 520,
+        quoteAreaX: 640,
+        maxContentHeight: 480,
+    };
+
+    const FONT_SIZES = {
+        initial: 42,
+        minimum: 18,
+        decrement: 2,
+        lineHeightMultiplier: 1.25,
+        authorMultiplier: 0.6,
+        usernameMultiplier: 0.45,
+        authorMinimum: 22,
+        usernameMinimum: 18,
+        watermark: 18,
+    };
+
+    const SPACING = {
+        authorTop: 60,
+        username: 10,
+        gradientWidth: 400,
+        watermarkPadding: 20,
+    };
+
     function ensureDefaults() {
-        for (const [key, value] of Object.entries(API_DEFAULTS)) {
-            if (storage[key] === undefined) {
-                storage[key] = value;
-            }
-        }
+        storage.grayscale ??= DEFAULTS.grayscale;
+        storage.showWatermark ??= DEFAULTS.showWatermark;
+        storage.watermark ??= DEFAULTS.watermark;
     }
 
-    function showToast(text) {
-        const icon = assets.getAssetIDByName("Check");
-        uiToasts.showToast(text, icon);
+    function toast(message, iconName = "Check") {
+        const icon = getAssetIDByName(iconName);
+        showToast(message, icon);
     }
 
-    function showErrorToast(text) {
-        const icon = assets.getAssetIDByName("Small");
-        uiToasts.showToast(text, icon);
-    }
-
-    function upgradeAvatarUrl(url) {
-        if (!url || typeof url !== "string") return "";
-        try {
-            const parsed = new URL(url);
-            parsed.searchParams.set("size", "512");
-
-            const isDiscordCdn = parsed.hostname === "cdn.discordapp.com"
-                || parsed.hostname === "media.discordapp.net";
-            if (isDiscordCdn) {
-                // Popcat quote endpoint is picky with avatar formats; enforce static PNG.
-                parsed.pathname = parsed.pathname.replace(/\.(webp|gif|jpg|jpeg)$/i, ".png");
-                parsed.searchParams.set("format", "png");
-            }
-
-            return parsed.toString();
-        } catch {
-            return url;
-        }
+    function errorToast(message) {
+        toast(message, "Small");
     }
 
     function normalizeText(text) {
@@ -71,445 +78,672 @@
         return String(text).replace(/\s+/g, " ").trim();
     }
 
-    function getMessageAuthor(message) {
-        return message?.author ?? message?.user ?? {};
+    function sizeUpgrade(url) {
+        if (!url || typeof url !== "string") return "";
+        try {
+            const parsed = new URL(url);
+            parsed.searchParams.set("size", "512");
+            if (parsed.hostname === "cdn.discordapp.com" || parsed.hostname === "media.discordapp.net") {
+                parsed.pathname = parsed.pathname.replace(/\.(webp|gif|jpg|jpeg)$/i, ".png");
+                parsed.searchParams.set("format", "png");
+            }
+            return parsed.toString();
+        } catch {
+            return url;
+        }
     }
 
-    function getAuthorDisplayName(author) {
+    function fixUpQuote(rawQuote) {
+        let result = String(rawQuote ?? "").replace(/<a?:(\w+):(\d+)>/g, "");
+        const mentionMatches = result.match(/<@!?\d+>/g);
+        if (!mentionMatches) return normalizeText(result);
+
+        for (const match of mentionMatches) {
+            const userId = match.replace(/[<@!>]/g, "");
+            const user = UserStore?.getUser?.(userId);
+            if (user?.username) {
+                result = result.replace(match, `@${user.username}`);
+            }
+        }
+
+        return normalizeText(result);
+    }
+
+    function getMessageAuthor(message) {
+        return message?.author ?? {};
+    }
+
+    function getDisplayName(author) {
         return author?.globalName || author?.global_name || author?.username || "Unknown";
     }
 
-    function getAuthorId(author) {
-        return author?.id ?? author?.userId ?? author?.user_id ?? null;
+    function getAuthorUsername(author) {
+        return String(author?.username || "unknown").replace(/[^\w.-]/g, "").slice(0, 32) || "unknown";
     }
 
-    function getAuthorAvatarHash(author) {
-        return author?.avatar ?? author?.avatarHash ?? author?.avatar_hash ?? null;
-    }
+    function getAvatarUrl(author) {
+        try {
+            if (typeof author?.getAvatarURL === "function") {
+                return sizeUpgrade(author.getAvatarURL());
+            }
+        } catch { }
 
-    function getDiscordCdnAvatarUrl(author) {
-        const authorId = getAuthorId(author);
-        const avatarHash = getAuthorAvatarHash(author);
+        try {
+            if (AvatarUtils && typeof AvatarUtils.getUserAvatarURL === "function") {
+                return sizeUpgrade(AvatarUtils.getUserAvatarURL(author, false));
+            }
+        } catch { }
 
-        if (authorId && avatarHash) {
-            return `https://cdn.discordapp.com/avatars/${authorId}/${avatarHash}.png?size=512`;
+        if (author?.id && author?.avatar) {
+            return `https://cdn.discordapp.com/avatars/${author.id}/${author.avatar}.png?size=512`;
         }
 
         return "https://cdn.discordapp.com/embed/avatars/0.png?size=512";
-    }
-
-    function getAuthorAvatarUrl(author) {
-        try {
-            if (avatarUtils && typeof avatarUtils.getUserAvatarURL === "function") {
-                const avatarFromModule = avatarUtils.getUserAvatarURL(author, false);
-                if (typeof avatarFromModule === "string" && avatarFromModule.length > 0) {
-                    return upgradeAvatarUrl(avatarFromModule);
-                }
-            }
-        } catch { }
-
-        try {
-            if (typeof author?.getAvatarURL === "function") {
-                return upgradeAvatarUrl(author.getAvatarURL());
-            }
-        } catch { }
-
-        if (typeof author?.avatarURL === "string") return upgradeAvatarUrl(author.avatarURL);
-        if (typeof author?.avatarUrl === "string") return upgradeAvatarUrl(author.avatarUrl);
-        return upgradeAvatarUrl(getDiscordCdnAvatarUrl(author));
-    }
-
-    function getQuoteUrl(message) {
-        const text = normalizeText(message?.content).slice(0, 450);
-        const author = getMessageAuthor(message);
-        const name = getAuthorDisplayName(author).slice(0, 64);
-        const image = getAuthorAvatarUrl(author);
-
-        const endpoint = typeof storage.endpoint === "string" && storage.endpoint.trim()
-            ? storage.endpoint.trim()
-            : API_DEFAULTS.endpoint;
-
-        const url = new URL(endpoint);
-        url.searchParams.set("text", text || " ");
-        url.searchParams.set("name", name);
-        if (image) url.searchParams.set("image", image);
-
-        // Best-effort optional knobs for APIs that support these keys.
-        if (storage.grayscale) url.searchParams.set("grayscale", "true");
-        if (storage.showWatermark && storage.watermark) {
-            url.searchParams.set("watermark", String(storage.watermark).slice(0, 32));
-        }
-        if (storage.saveAsGif) url.searchParams.set("format", "gif");
-
-        return url.toString();
     }
 
     function getMessageChannelId(message) {
         return message?.channel_id || message?.channelId || message?.channel?.id || null;
     }
 
-    function sendQuoteMessage(message, quoteUrl) {
+    function buildFileName(message) {
+        const content = fixUpQuote(message?.content || "");
+        const preview = content.split(" ").filter(Boolean).slice(0, 6).join(" ");
+        const safePreview = (preview || "quote").replace(/[^\w.-]/g, "_").slice(0, 48);
+        const username = getAuthorUsername(getMessageAuthor(message));
+        return `${safePreview}-${username}.png`;
+    }
+
+    function buildPayload(message, options) {
+        const author = getMessageAuthor(message);
+        return {
+            quote: fixUpQuote(message?.content || "").slice(0, 420) || " ",
+            displayName: getDisplayName(author).slice(0, 64),
+            username: `@${getAuthorUsername(author)}`,
+            avatarUrl: getAvatarUrl(author),
+            grayscale: Boolean(options.grayscale),
+            showWatermark: Boolean(options.showWatermark),
+            watermark: String(options.watermark || "").slice(0, 32),
+            quoteFont: "M PLUS Rounded 1c",
+            canvas: CANVAS_CONFIG,
+            fonts: FONT_SIZES,
+            spacing: SPACING,
+        };
+    }
+
+    function buildRendererHtml(payload) {
+        const safePayload = JSON.stringify(payload).replace(/<\/script/gi, "<\\/script");
+
+        return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+@import url('https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@300&display=swap');
+html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+}
+canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+</style>
+</head>
+<body>
+<canvas id="q" width="1200" height="600"></canvas>
+<script>
+const payload = ${safePayload};
+
+function post(data) {
+    try {
+        window.ReactNativeWebView.postMessage(JSON.stringify(data));
+    } catch {}
+}
+
+function calculateTextLines(ctx, text, fontSize, font, maxWidth) {
+    ctx.font = "300 " + fontSize + "px '" + font + "', sans-serif";
+    const words = String(text || "").split(" ");
+    const lines = [];
+    let currentLine = [];
+
+    for (const word of words) {
+        const testLine = [...currentLine, word].join(" ");
+        if (ctx.measureText(testLine).width > maxWidth && currentLine.length) {
+            lines.push(currentLine.join(" "));
+            currentLine = [word];
+        } else {
+            currentLine.push(word);
+        }
+    }
+
+    if (currentLine.length) lines.push(currentLine.join(" "));
+    return lines;
+}
+
+function calculateFont(ctx, quote, font, cfg, fs, sp) {
+    let fontSize = fs.initial;
+    while (fontSize >= fs.minimum) {
+        const lines = calculateTextLines(ctx, quote, fontSize, font, cfg.quoteAreaWidth);
+        const lineHeight = fontSize * fs.lineHeightMultiplier;
+        const authorFontSize = Math.max(fs.authorMinimum, fontSize * fs.authorMultiplier);
+        const usernameFontSize = Math.max(fs.usernameMinimum, fontSize * fs.usernameMultiplier);
+        const totalHeight = (lines.length * lineHeight) + sp.authorTop + authorFontSize + sp.username + usernameFontSize;
+        if (totalHeight <= cfg.maxContentHeight) {
+            return { lines, fontSize, lineHeight, authorFontSize, usernameFontSize, totalHeight };
+        }
+        fontSize -= fs.decrement;
+    }
+
+    const lines = calculateTextLines(ctx, quote, fs.minimum, font, cfg.quoteAreaWidth);
+    const lineHeight = fs.minimum * fs.lineHeightMultiplier;
+    return {
+        lines,
+        fontSize: fs.minimum,
+        lineHeight,
+        authorFontSize: fs.authorMinimum,
+        usernameFontSize: fs.usernameMinimum,
+        totalHeight: (lines.length * lineHeight) + sp.authorTop + fs.authorMinimum + sp.username + fs.usernameMinimum,
+    };
+}
+
+async function loadAvatar(url) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("Failed to fetch avatar image.");
+    const blob = await response.blob();
+    const blobUrl = URL.createObjectURL(blob);
+
+    try {
+        return await new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = () => reject(new Error("Failed to load avatar image."));
+            img.src = blobUrl;
+        });
+    } finally {
+        URL.revokeObjectURL(blobUrl);
+    }
+}
+
+async function render() {
+    const cfg = payload.canvas;
+    const fs = payload.fonts;
+    const sp = payload.spacing;
+    const quoteFont = payload.quoteFont || "M PLUS Rounded 1c";
+
+    const canvas = document.getElementById("q");
+    canvas.width = cfg.width;
+    canvas.height = cfg.height;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas context unavailable.");
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, cfg.width, cfg.height);
+
+    const avatar = await loadAvatar(payload.avatarUrl);
+    ctx.drawImage(avatar, 0, 0, cfg.height, cfg.height);
+
+    if (payload.grayscale) {
+        ctx.globalCompositeOperation = "saturation";
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, cfg.width, cfg.height);
+        ctx.globalCompositeOperation = "source-over";
+    }
+
+    const gradient = ctx.createLinearGradient(cfg.height - sp.gradientWidth, 0, cfg.height, 0);
+    gradient.addColorStop(0, "rgba(0, 0, 0, 0)");
+    gradient.addColorStop(1, "rgba(0, 0, 0, 1)");
+    ctx.fillStyle = gradient;
+    ctx.fillRect(cfg.height - sp.gradientWidth, 0, sp.gradientWidth, cfg.height);
+
+    const quote = String(payload.quote || " ");
+    const calculation = calculateFont(ctx, quote, quoteFont, cfg, fs, sp);
+
+    ctx.fillStyle = "#fff";
+    ctx.font = "300 " + calculation.fontSize + "px '" + quoteFont + "', sans-serif";
+    let quoteY = (cfg.height - calculation.totalHeight) / 2;
+    for (const line of calculation.lines) {
+        const xOffset = (cfg.quoteAreaWidth - ctx.measureText(line).width) / 2;
+        quoteY += calculation.lineHeight;
+        ctx.fillText(line, cfg.quoteAreaX + xOffset, quoteY);
+    }
+
+    const authorText = "- " + String(payload.displayName || "Unknown");
+    ctx.font = "italic 300 " + calculation.authorFontSize + "px 'M PLUS Rounded 1c', sans-serif";
+    ctx.fillStyle = "#fff";
+    const authorX = cfg.quoteAreaX + (cfg.quoteAreaWidth - ctx.measureText(authorText).width) / 2;
+    const authorY = quoteY + sp.authorTop;
+    ctx.fillText(authorText, authorX, authorY);
+
+    const usernameText = String(payload.username || "@unknown");
+    ctx.font = "300 " + calculation.usernameFontSize + "px 'M PLUS Rounded 1c', sans-serif";
+    ctx.fillStyle = "#888";
+    const usernameX = cfg.quoteAreaX + (cfg.quoteAreaWidth - ctx.measureText(usernameText).width) / 2;
+    const usernameY = authorY + sp.username + calculation.usernameFontSize;
+    ctx.fillText(usernameText, usernameX, usernameY);
+
+    if (payload.showWatermark && payload.watermark) {
+        const watermarkText = String(payload.watermark).slice(0, 32);
+        ctx.fillStyle = "#888";
+        ctx.font = "300 " + fs.watermark + "px 'M PLUS Rounded 1c', sans-serif";
+        const watermarkX = cfg.width - ctx.measureText(watermarkText).width - sp.watermarkPadding;
+        const watermarkY = cfg.height - sp.watermarkPadding;
+        ctx.fillText(watermarkText, watermarkX, watermarkY);
+    }
+
+    const dataUrl = canvas.toDataURL("image/png");
+    post({ type: "result", dataUrl, renderId: payload.renderId });
+}
+
+render().catch(error => {
+    post({
+        type: "error",
+        renderId: payload.renderId,
+        message: String(error && error.message ? error.message : error),
+    });
+});
+</script>
+</body>
+</html>`;
+    }
+
+    function getOptions() {
+        return {
+            grayscale: Boolean(storage.grayscale),
+            showWatermark: Boolean(storage.showWatermark),
+            watermark: String(storage.watermark ?? DEFAULTS.watermark),
+        };
+    }
+
+    function setOptions(options) {
+        storage.grayscale = Boolean(options.grayscale);
+        storage.showWatermark = Boolean(options.showWatermark);
+        storage.watermark = String(options.watermark ?? "");
+    }
+
+    async function sendGeneratedImage(message, dataUrl) {
+        if (!UploadHandler || typeof UploadHandler.promptToUpload !== "function") {
+            throw new Error("Upload handler unavailable on this build.");
+        }
+
         const channelId = getMessageChannelId(message);
         if (!channelId) throw new Error("Unable to resolve message channel.");
 
-        if (!messageActions || typeof messageActions.sendMessage !== "function") {
-            throw new Error("Unable to send message from this client build.");
+        const response = await fetch(dataUrl);
+        if (!response.ok) throw new Error("Failed to build quote image payload.");
+        const blob = await response.blob();
+
+        if (typeof File !== "function") {
+            throw new Error("File constructor unavailable on this build.");
         }
 
-        messageActions.sendMessage(
-            channelId,
-            {
-                content: quoteUrl,
-                tts: false,
-                invalidEmojis: [],
-                validNonShortcutEmojis: [],
-            },
-            undefined,
-            { nonce: Date.now().toString() },
-        );
+        const channel = ChannelStore?.getChannel?.(channelId) ?? { id: channelId };
+        const file = new File([blob], buildFileName(message), { type: "image/png" });
+        UploadHandler.promptToUpload([file], channel, 0);
     }
 
-    function renderQuotePreview(quoteUrl) {
-        const width = Math.max(
-            220,
-            Math.min(
-                320,
-                (ReactNative?.Dimensions?.get?.("window")?.width ?? 320) - 96,
-            ),
+    function QuotePreviewCard({ message, onStateChange }) {
+        const [options, setLocalOptions] = React.useState(getOptions);
+        const [dataUrl, setDataUrl] = React.useState("");
+        const [error, setError] = React.useState("");
+
+        const renderId = React.useMemo(
+            () => `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+            [message, options.grayscale, options.showWatermark, options.watermark],
         );
-        const height = Math.round(width * 0.56);
+
+        const payload = React.useMemo(
+            () => ({
+                ...buildPayload(message, options),
+                renderId,
+            }),
+            [message, options.grayscale, options.showWatermark, options.watermark, renderId],
+        );
+
+        const html = React.useMemo(() => buildRendererHtml(payload), [payload]);
+
+        React.useEffect(() => {
+            setOptions(options);
+        }, [options]);
+
+        React.useEffect(() => {
+            setDataUrl("");
+            setError("");
+        }, [renderId]);
+
+        React.useEffect(() => {
+            onStateChange?.({
+                dataUrl,
+                options,
+            });
+        }, [dataUrl, options, onStateChange]);
+
+        const setOption = (key, value) => {
+            setLocalOptions(current => ({ ...current, [key]: value }));
+        };
+
+        const onWebViewMessage = event => {
+            const raw = event?.nativeEvent?.data;
+            if (typeof raw !== "string") return;
+
+            let parsed;
+            try {
+                parsed = JSON.parse(raw);
+            } catch {
+                return;
+            }
+
+            if (parsed?.renderId !== renderId) return;
+
+            if (parsed.type === "result" && typeof parsed.dataUrl === "string") {
+                setDataUrl(parsed.dataUrl);
+                setError("");
+                return;
+            }
+
+            if (parsed.type === "error") {
+                setError(String(parsed.message || "Failed to render quote image."));
+            }
+        };
+
+        const previewWidth = Math.max(
+            230,
+            Math.min((ReactNative?.Dimensions?.get?.("window")?.width ?? 360) - 88, 420),
+        );
+        const previewHeight = Math.round(previewWidth * (CANVAS_CONFIG.height / CANVAS_CONFIG.width));
 
         return React.createElement(
-            ReactNative.View,
+            ReactNative.ScrollView,
             {
-                style: {
-                    marginTop: 12,
-                    marginBottom: 4,
-                    alignItems: "center",
-                },
+                style: { maxHeight: 470 },
+                contentContainerStyle: { paddingTop: 10, paddingBottom: 4 },
             },
             [
-                React.createElement(ReactNative.Image, {
-                    key: "quote-preview-image",
-                    source: { uri: quoteUrl },
-                    resizeMode: "cover",
-                    style: {
-                        width,
-                        height,
-                        borderRadius: 12,
-                        backgroundColor: "#111",
+                React.createElement(
+                    ReactNative.View,
+                    {
+                        key: "quote-preview-wrap",
+                        style: {
+                            width: previewWidth,
+                            height: previewHeight,
+                            alignSelf: "center",
+                            borderRadius: 14,
+                            overflow: "hidden",
+                            backgroundColor: "#0f0f0f",
+                            justifyContent: "center",
+                            alignItems: "center",
+                        },
                     },
-                }),
+                    dataUrl
+                        ? React.createElement(ReactNative.Image, {
+                            source: { uri: dataUrl },
+                            resizeMode: "cover",
+                            style: {
+                                width: "100%",
+                                height: "100%",
+                            },
+                        })
+                        : React.createElement(ReactNative.Text, {
+                            style: {
+                                color: "#bbb",
+                                textAlign: "center",
+                                fontSize: 12,
+                                paddingHorizontal: 12,
+                            },
+                        }, "Generating preview..."),
+                ),
+                WebView
+                    ? React.createElement(WebView, {
+                        key: `quote-renderer-${renderId}`,
+                        source: {
+                            html,
+                            baseUrl: "https://localhost",
+                        },
+                        onMessage: onWebViewMessage,
+                        style: {
+                            width: 0,
+                            height: 0,
+                            opacity: 0,
+                        },
+                    })
+                    : null,
                 React.createElement(
                     ReactNative.Text,
                     {
-                        key: "quote-preview-text",
+                        key: "quote-preview-caption",
                         style: {
                             color: "#aaa",
                             marginTop: 8,
+                            textAlign: "center",
                             fontSize: 12,
                         },
                     },
                     "Preview generated from selected message",
                 ),
+                error
+                    ? React.createElement(
+                        ReactNative.Text,
+                        {
+                            key: "quote-preview-error",
+                            style: {
+                                color: "#f66",
+                                marginTop: 8,
+                                textAlign: "center",
+                                fontSize: 12,
+                            },
+                        },
+                        error,
+                    )
+                    : null,
+                React.createElement(
+                    ReactNative.View,
+                    {
+                        key: "toggle-grayscale",
+                        style: {
+                            marginTop: 10,
+                            flexDirection: "row",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                        },
+                    },
+                    [
+                        React.createElement(ReactNative.Text, { style: { color: "#fff", fontSize: 15 } }, "Grayscale"),
+                        ReactNative.Switch
+                            ? React.createElement(ReactNative.Switch, {
+                                value: options.grayscale,
+                                onValueChange: value => setOption("grayscale", value),
+                            })
+                            : React.createElement(
+                                ReactNative.Pressable,
+                                { onPress: () => setOption("grayscale", !options.grayscale) },
+                                React.createElement(
+                                    ReactNative.Text,
+                                    { style: { color: "#fff", fontSize: 13 } },
+                                    options.grayscale ? "ON" : "OFF",
+                                ),
+                            ),
+                    ],
+                ),
+                React.createElement(
+                    ReactNative.View,
+                    {
+                        key: "toggle-watermark",
+                        style: {
+                            marginTop: 10,
+                            flexDirection: "row",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                        },
+                    },
+                    [
+                        React.createElement(ReactNative.Text, { style: { color: "#fff", fontSize: 15 } }, "Show Watermark"),
+                        ReactNative.Switch
+                            ? React.createElement(ReactNative.Switch, {
+                                value: options.showWatermark,
+                                onValueChange: value => setOption("showWatermark", value),
+                            })
+                            : React.createElement(
+                                ReactNative.Pressable,
+                                { onPress: () => setOption("showWatermark", !options.showWatermark) },
+                                React.createElement(
+                                    ReactNative.Text,
+                                    { style: { color: "#fff", fontSize: 13 } },
+                                    options.showWatermark ? "ON" : "OFF",
+                                ),
+                            ),
+                    ],
+                ),
+                options.showWatermark
+                    ? React.createElement(ReactNative.TextInput, {
+                        key: "watermark-input",
+                        value: options.watermark,
+                        onChangeText: value => setOption("watermark", value),
+                        placeholder: "Watermark text (max 32 characters)",
+                        placeholderTextColor: "#666",
+                        maxLength: 32,
+                        style: {
+                            color: "#fff",
+                            borderWidth: 1,
+                            borderColor: "#444",
+                            borderRadius: 8,
+                            paddingHorizontal: 12,
+                            paddingVertical: 10,
+                            marginTop: 10,
+                        },
+                    })
+                    : null,
             ],
         );
     }
 
-    function extractMessage(config) {
-        if (!config || typeof config !== "object") return null;
+    function openQuoteModal(message) {
+        let modalState = {
+            dataUrl: "",
+            options: getOptions(),
+        };
 
-        const candidates = [
-            config.message,
-            config.targetMessage,
-            config.messageRecord,
-            config?.payload?.message,
-            config?.args?.message,
-            config?.args?.[0]?.message,
-            config?.messageItem?.message,
-            config?.messageContext?.message,
-            config?.target?.message,
-            config?.payload?.targetMessage,
-        ];
-
-        for (const candidate of candidates) {
-            if (candidate && typeof candidate === "object" && candidate.content != null) {
-                return candidate;
-            }
-        }
-
-        return deepFindMessage(config);
-    }
-
-    function looksLikeMessage(value) {
-        if (!value || typeof value !== "object") return false;
-        if (value.content == null) return false;
-        return (
-            value.author != null
-            || value.channel_id != null
-            || value.channelId != null
-            || value.timestamp != null
-            || value.id != null
-        );
-    }
-
-    function deepFindMessage(root) {
-        const stack = [root];
-        const seen = new Set();
-
-        while (stack.length) {
-            const current = stack.pop();
-            if (!current || typeof current !== "object") continue;
-            if (seen.has(current)) continue;
-            seen.add(current);
-
-            if (looksLikeMessage(current)) return current;
-
-            if (Array.isArray(current)) {
-                for (const item of current) {
-                    stack.push(item);
-                }
-                continue;
-            }
-
-            for (const value of Object.values(current)) {
-                if (value && typeof value === "object") {
-                    stack.push(value);
-                }
-            }
-        }
-
-        return null;
-    }
-
-    function handleQuoteAction(message) {
-        const quoteUrl = getQuoteUrl(message);
-        const preview = renderQuotePreview(quoteUrl);
-
-        alerts.showConfirmationAlert({
+        showConfirmationAlert({
             title: "Create Quote",
-            content: "Send quote image link in chat or copy the image link.",
-            children: preview,
+            content: "Generate and send quote image.",
+            children: React.createElement(QuotePreviewCard, {
+                message,
+                onStateChange: state => {
+                    if (state && typeof state === "object") {
+                        modalState = {
+                            ...modalState,
+                            ...state,
+                        };
+                    }
+                },
+            }),
             confirmText: "Send",
             cancelText: "Cancel",
             secondaryConfirmText: "Copy Link",
             onConfirm: () => {
-                try {
-                    sendQuoteMessage(message, quoteUrl);
-                    showToast("Quote sent.");
-                } catch (error) {
-                    const text = error instanceof Error ? error.message : String(error);
-                    showErrorToast(`Failed to send quote: ${text}`);
-                }
+                void (async () => {
+                    try {
+                        if (!modalState.dataUrl) throw new Error("Quote image is not ready yet.");
+                        await sendGeneratedImage(message, modalState.dataUrl);
+                        toast("Quote sent as image.");
+                    } catch (error) {
+                        const msg = error instanceof Error ? error.message : String(error);
+                        errorToast(`Failed to send quote: ${msg}`);
+                    }
+                })();
             },
             onConfirmSecondary: () => {
                 try {
-                    clipboard.setString(quoteUrl);
-                    showToast("Quote URL copied.");
+                    if (!modalState.dataUrl) throw new Error("Quote image is not ready yet.");
+                    clipboard.setString(modalState.dataUrl);
+                    toast("Quote image data copied.");
                 } catch (error) {
-                    const text = error instanceof Error ? error.message : String(error);
-                    showErrorToast(`Failed to copy URL: ${text}`);
+                    const msg = error instanceof Error ? error.message : String(error);
+                    errorToast(`Failed to copy quote image: ${msg}`);
                 }
             },
         });
     }
 
-    function isMessageLongPressSheetKey(key) {
-        return typeof key === "string"
-            && (
-                key === "MessageLongPressActionSheet"
-                || key.includes("MessageLongPress")
-            );
-    }
-
-    function getButtonMessage(button) {
-        return String(
-            button?.props?.message
-            ?? button?.props?.label
-            ?? button?.props?.title
-            ?? button?.props?.text
-            ?? "",
+    function injectQuoteButton(sheetTree, message) {
+        const rows = findInReactTree(sheetTree, node =>
+            Array.isArray(node) && (
+                node[0]?.type?.name === "ButtonRow"
+                || node[0]?.type?.name === "ActionSheetRow"
+                || node[0]?.type?.name === "TableRow"
+            ),
         );
-    }
 
-    function hasQuoteButton(buttons) {
-        return buttons.some(button => getButtonMessage(button) === "Quote");
-    }
+        if (!rows || !Array.isArray(rows)) return sheetTree;
+        if (rows.some(row => String(row?.props?.message ?? row?.props?.label ?? "") === "Quote")) return sheetTree;
 
-    function getInsertIndex(buttons) {
-        const targets = [
-            "Mark Unread",
-            "Copy Text",
-            "Apps",
-            "Mention",
-        ];
+        const template = rows.find(Boolean);
+        if (!template?.type) return sheetTree;
 
-        for (const target of targets) {
-            const index = buttons.findIndex(button => getButtonMessage(button) === target);
-            if (index >= 0) return index;
-        }
-
-        return Math.min(4, buttons.length);
-    }
-
-    function isActionRowElement(element) {
-        if (!element || typeof element !== "object" || !element.type || !element.props) {
-            return false;
-        }
-
-        const props = element.props;
-        return typeof props.onPress === "function"
-            || typeof props.action === "function";
-    }
-
-    function findBestRowArray(root) {
-        const knownLabels = new Set([
-            "Edit Message",
-            "Reply",
-            "Forward",
-            "Create Thread",
-            "Copy Text",
-            "Mark Unread",
-            "Pin Message",
-            "Apps",
-            "Mention",
-            "Copy Message Link",
-            "Copy Message ID",
-            "Delete Message",
-        ]);
-
-        const stack = [root];
-        const seen = new Set();
-        let best = null;
-        let bestScore = -1;
-
-        while (stack.length) {
-            const current = stack.pop();
-            if (!current || typeof current !== "object") continue;
-            if (seen.has(current)) continue;
-            seen.add(current);
-
-            if (Array.isArray(current)) {
-                const rows = current.filter(isActionRowElement);
-                if (rows.length >= 3) {
-                    let score = rows.length;
-                    for (const row of rows) {
-                        if (knownLabels.has(getButtonMessage(row))) {
-                            score += 10;
-                        }
-                    }
-
-                    if (score > bestScore) {
-                        bestScore = score;
-                        best = current;
-                    }
-                }
-
-                for (const item of current) {
-                    if (item && typeof item === "object") stack.push(item);
-                }
-                continue;
-            }
-
-            for (const value of Object.values(current)) {
-                if (value && typeof value === "object") {
-                    stack.push(value);
-                }
-            }
-        }
-
-        return best;
-    }
-
-    function createQuoteButton(templateButton, message) {
-        if (!templateButton?.type) return null;
-
+        const icon = getAssetIDByName("ChatXIcon") ?? template.props?.icon;
         const onPress = () => {
             try {
-                actionSheetModule?.hideActionSheet?.();
+                LazyActionSheet?.hideActionSheet?.();
             } catch { }
-
-            setTimeout(() => handleQuoteAction(message), 0);
+            setTimeout(() => openQuoteModal(message), 0);
         };
 
-        const fallbackIcon = assets.getAssetIDByName("LinkIcon");
-
-        const props = {
-            ...templateButton.props,
+        const quoteRow = React.createElement(template.type, {
+            ...template.props,
             key: "kettu-quoter-button",
-            message: "Quote",
             label: "Quote",
+            message: "Quote",
             title: "Quote",
             text: "Quote",
-            icon: fallbackIcon ?? templateButton?.props?.icon,
-            variant: undefined,
+            icon,
             isDestructive: false,
+            variant: undefined,
             onPress,
             action: onPress,
-        };
+        });
 
-        return React.createElement(templateButton.type, props);
+        const index = Math.max(
+            rows.findIndex(row => {
+                const label = String(row?.props?.message ?? row?.props?.label ?? row?.props?.title ?? "");
+                return label === "Mark Unread";
+            }),
+            0,
+        );
+
+        rows.splice(index, 0, quoteRow);
+        return sheetTree;
     }
 
-    function injectQuoteIntoMessageSheet(sheetTree, message) {
-        const buttons = findBestRowArray(sheetTree);
-
-        if (!buttons || hasQuoteButton(buttons)) return;
-
-        const template = buttons.find(button => button?.type?.name === "ButtonRow")
-            ?? buttons.find(button => button?.type?.name === "ActionSheetRow")
-            ?? buttons.find(button => button?.type?.name === "TableRow")
-            ?? buttons.find(Boolean);
-        const quoteButton = createQuoteButton(template, message);
-        if (!quoteButton) return;
-
-        const at = getInsertIndex(buttons);
-        buttons.splice(at, 0, quoteButton);
-    }
-
-    function patchMessageContextMenu() {
-        if (actionSheetModule && typeof actionSheetModule.openLazy === "function") {
-            const unpatchActionSheet = vendetta.patcher.before(
-                "openLazy",
-                actionSheetModule,
-                args => {
-                    const lazyComponent = args?.[0];
-                    const key = args?.[1];
-                    const payload = args?.[2];
-                    if (!isMessageLongPressSheetKey(key)) return;
-
-                    const message = extractMessage(payload);
-                    if (!message || !normalizeText(message.content)) return;
-
-                    Promise.resolve(lazyComponent).then(module => {
-                        if (!module || typeof module.default !== "function") return;
-
-                        const unpatchModalRender = vendetta.patcher.after(
-                            "default",
-                            module,
-                            (_, sheetTree) => {
-                                React.useEffect(
-                                    () => () => unpatchModalRender(),
-                                    [],
-                                );
-
-                                injectQuoteIntoMessageSheet(sheetTree, message);
-                                return sheetTree;
-                            },
-                        );
-                    }).catch(() => { });
-                },
-            );
-
-            patches.push(unpatchActionSheet);
-        } else {
-            vendetta.logger.warn(`[${MODULE_TAG}] openLazy action sheet module not found.`);
+    function patchMessageLongPressSheet() {
+        if (!LazyActionSheet || typeof LazyActionSheet.openLazy !== "function") {
+            throw new Error("Action sheet module unavailable.");
         }
+
+        const unpatch = vendetta.patcher.before("openLazy", LazyActionSheet, ([component, key, ctx]) => {
+            const message = ctx?.message;
+            if (key !== "MessageLongPressActionSheet" || !message?.content) return;
+
+            Promise.resolve(component).then(mod => {
+                if (!mod || typeof mod.default !== "function") return;
+
+                const unpatchRender = vendetta.patcher.after("default", mod, (_, sheetTree) => {
+                    React.useEffect(() => () => unpatchRender(), []);
+                    return injectQuoteButton(sheetTree, message);
+                });
+            }).catch(() => { });
+        });
+
+        patches.push(unpatch);
     }
 
     function SettingsPanel() {
         const h = React.createElement;
-        const [, forceUpdate] = React.useReducer(v => v + 1, 0);
+        const [, forceUpdate] = React.useReducer(value => value + 1, 0);
 
         const setValue = (key, value) => {
             storage[key] = value;
@@ -582,22 +816,8 @@
             },
             [
                 sectionTitle(
-                    "Quote API Endpoint",
-                    "Default: https://api.popcat.xyz/quote",
-                ),
-                h(ReactNative.TextInput, {
-                    value: String(storage.endpoint ?? ""),
-                    onChangeText: value => setValue("endpoint", value),
-                    autoCapitalize: "none",
-                    autoCorrect: false,
-                    style: inputStyle,
-                    placeholder: "https://api.popcat.xyz/quote",
-                    placeholderTextColor: "#666",
-                }),
-
-                sectionTitle(
                     "Watermark Text",
-                    "Only used when watermark is enabled. Max 32 chars are sent.",
+                    "Only used when watermark is enabled. Max 32 chars.",
                 ),
                 h(ReactNative.TextInput, {
                     value: String(storage.watermark ?? ""),
@@ -609,19 +829,23 @@
                     placeholderTextColor: "#666",
                     maxLength: 64,
                 }),
-
                 toggleRow("Grayscale", "grayscale"),
                 toggleRow("Show Watermark", "showWatermark"),
-                toggleRow("Save as GIF (API dependent)", "saveAsGif"),
             ],
         );
     }
 
     return {
         onLoad() {
-            ensureDefaults();
-            patchMessageContextMenu();
-            showToast("Quoter loaded.");
+            try {
+                ensureDefaults();
+                patchMessageLongPressSheet();
+                toast("Quoter loaded.");
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : String(error);
+                errorToast(`Quoter failed to load: ${msg}`);
+                throw error;
+            }
         },
 
         onUnload() {
@@ -634,4 +858,4 @@
 
         settings: SettingsPanel,
     };
-})()
+})();
