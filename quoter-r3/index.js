@@ -903,6 +903,31 @@ render().catch(error => {
         return Number.isFinite(value) ? value : 0;
     }
 
+    function decodeBase64ToBytes(base64) {
+        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const clean = String(base64 || "").replace(/[^A-Za-z0-9+/=]/g, "");
+        const out = [];
+        let buffer = 0;
+        let bits = 0;
+
+        for (let i = 0; i < clean.length; i++) {
+            const ch = clean[i];
+            if (ch === "=") break;
+            const value = alphabet.indexOf(ch);
+            if (value < 0) continue;
+
+            buffer = (buffer << 6) | value;
+            bits += 6;
+
+            if (bits >= 8) {
+                bits -= 8;
+                out.push((buffer >> bits) & 0xff);
+            }
+        }
+
+        return new Uint8Array(out);
+    }
+
     function dataUrlToBlob(dataUrl) {
         if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) {
             return null;
@@ -918,12 +943,16 @@ render().catch(error => {
 
         try {
             if (isBase64) {
-                if (typeof atob !== "function") return null;
-                const binary = atob(body);
-                const bytes = new Uint8Array(binary.length);
-                for (let i = 0; i < binary.length; i++) {
-                    bytes[i] = binary.charCodeAt(i);
+                if (typeof atob === "function") {
+                    const binary = atob(body);
+                    const bytes = new Uint8Array(binary.length);
+                    for (let i = 0; i < binary.length; i++) {
+                        bytes[i] = binary.charCodeAt(i);
+                    }
+                    return new Blob([bytes], { type: mime });
                 }
+
+                const bytes = decodeBase64ToBytes(body);
                 return new Blob([bytes], { type: mime });
             }
 
