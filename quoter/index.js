@@ -505,11 +505,16 @@ render().catch(error => {
                             html,
                             baseUrl: "https://localhost",
                         },
+                        javaScriptEnabled: true,
+                        domStorageEnabled: true,
                         onMessage: onWebViewMessage,
                         style: {
-                            width: 0,
-                            height: 0,
+                            width: 1,
+                            height: 1,
                             opacity: 0,
+                            position: "absolute",
+                            left: -9999,
+                            top: -9999,
                         },
                     })
                     : null,
