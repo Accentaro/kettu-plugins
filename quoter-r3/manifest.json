@@ -1,0 +1,21 @@
+{
+  "name": "Quoter R3",
+  "description": "Quoter test build r3 with upload fallback and build stamp.",
+  "authors": [
+    {
+      "name": "newar"
+    }
+  ],
+  "main": "index.js",
+  "hash": "2a6c73bdef79e904a2a9d2344c5761c5a4de2cc80e0b03921c303c9394c0af8a",
+  "vendetta": {
+    "icon": "ChatXIcon"
+  }
+}
+
+
+
+
+
+
+
