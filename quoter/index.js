@@ -1172,6 +1172,8 @@ render().catch(error => {
         const key = normalizeLower(candidate?.key || "");
         const source = normalizeLower(candidate?.source || "");
         if (key === "prompttoupload") return true;
+        if (key.includes("message_create_attachment_upload")) return true;
+        if (key.includes("instantbatchupload")) return true;
         if (source.includes("showuploadfilesizeexceedederror,prompttoupload")) return true;
         if (source.includes("findbyprops(prompttoupload)")) return true;
 
@@ -1181,6 +1183,18 @@ render().catch(error => {
         } catch {
             return false;
         }
+    }
+
+    function shouldSkipUploadCandidate(candidate) {
+        const key = normalizeLower(candidate?.key || "");
+        if (!key) return false;
+        if (key.startsWith("can") || key.startsWith("is") || key.startsWith("get") || key.startsWith("set") || key.startsWith("use")) {
+            return !key.includes("upload");
+        }
+        if (key.includes("config") || key.includes("limit") || key.includes("roadblock") || key.includes("error")) {
+            return true;
+        }
+        return false;
     }
 
     function getUploadManager() {
@@ -1269,10 +1283,7 @@ render().catch(error => {
     }
 
     function sendGeneratedImage(message, dataUrl) {
-        const uploadCandidates = buildUploadFunctionCandidates(true)
-            .filter(isLikelyPrimaryUploaderCandidate)
-            .sort((a, b) => b.score - a.score);
-
+        const uploadCandidates = buildUploadFunctionCandidates(true).slice();
         if (!uploadCandidates.length) {
             return Promise.reject(new Error(`Upload handler unavailable on this build. ${lastUploadLookupDiagnostics}`));
         }
@@ -1288,11 +1299,46 @@ render().catch(error => {
             if (!uploadable) throw new Error("Invalid rendered quote image.");
 
             const draftType = getChannelMessageDraftType();
-            const primary = uploadCandidates[0];
-            logDebug("Send quote using upload handler", `${primary.key}@${primary.source}[${primary.score}]`);
-            return invokePromptUploadDirect(primary, uploadable, channel, channelId, draftType).catch(error => {
-                const message = error instanceof Error ? error.message : String(error);
-                throw new Error(`Upload handler invocation failed: ${message}`);
+            const primaryCandidates = uploadCandidates
+                .filter(isLikelyPrimaryUploaderCandidate)
+                .filter(candidate => !shouldSkipUploadCandidate(candidate));
+            const secondaryCandidates = uploadCandidates
+                .filter(candidate => !isLikelyPrimaryUploaderCandidate(candidate))
+                .filter(candidate => !shouldSkipUploadCandidate(candidate));
+            const rankedCandidates = [...primaryCandidates, ...secondaryCandidates].slice(0, 80);
+
+            if (!rankedCandidates.length) {
+                throw new Error(`Upload handler unavailable on this build. ${lastUploadLookupDiagnostics}`);
+            }
+
+            logDebug("Send quote using upload candidates", rankedCandidates.map(c => `${c.key}@${c.source}[${c.score}]`).join(", "));
+
+            return new Promise((resolve, reject) => {
+                let index = 0;
+                let lastError = null;
+                const shortErrors = [];
+
+                const run = () => {
+                    if (index >= rankedCandidates.length) {
+                        const detail = lastError instanceof Error ? lastError.message : String(lastError || "unknown");
+                        const summary = shortErrors.length ? ` tried=${shortErrors.join(" | ")}` : "";
+                        reject(new Error(`Upload handler invocation failed: ${detail}.${summary} ${lastUploadLookupDiagnostics}`));
+                        return;
+                    }
+
+                    const candidate = rankedCandidates[index++];
+                    invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType, fileName).then(() => {
+                        logDebug("Upload candidate succeeded", `${candidate.key}@${candidate.source}[${candidate.score}]`);
+                        resolve();
+                    }).catch(error => {
+                        lastError = error;
+                        const msg = error instanceof Error ? error.message : String(error);
+                        if (shortErrors.length < 6) shortErrors.push(`${candidate.key}:${msg}`);
+                        run();
+                    });
+                };
+
+                run();
             });
         });
     }
