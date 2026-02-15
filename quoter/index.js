@@ -928,11 +928,8 @@ render().catch(error => {
         return new Uint8Array(out);
     }
 
-    function dataUrlToBlob(dataUrl) {
-        if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) {
-            return null;
-        }
-
+    function parseDataUrl(dataUrl) {
+        if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) return null;
         const commaIndex = dataUrl.indexOf(",");
         if (commaIndex < 0) return null;
 
@@ -940,6 +937,21 @@ render().catch(error => {
         const body = dataUrl.slice(commaIndex + 1);
         const isBase64 = meta.includes(";base64");
         const mime = (meta.split(";")[0] || "image/png").trim() || "image/png";
+
+        return {
+            meta,
+            body,
+            isBase64,
+            mime,
+            normalized: `data:${meta},${body}`,
+        };
+    }
+
+    function dataUrlToBlob(dataUrl) {
+        const parsed = parseDataUrl(dataUrl);
+        if (!parsed || typeof Blob !== "function") return null;
+
+        const { body, isBase64, mime } = parsed;
 
         try {
             if (isBase64) {
@@ -961,6 +973,21 @@ render().catch(error => {
         } catch {
             return null;
         }
+    }
+
+    function dataUrlToUploadObject(dataUrl, fileName) {
+        const parsed = parseDataUrl(dataUrl);
+        if (!parsed) return null;
+
+        return {
+            uri: parsed.normalized,
+            path: parsed.normalized,
+            name: fileName,
+            fileName,
+            filename: fileName,
+            mimeType: parsed.mime,
+            type: parsed.mime,
+        };
     }
 
     function resolveChannel(channelId) {
@@ -1110,19 +1137,23 @@ render().catch(error => {
 
         const fileName = buildFileName(message);
         const blob = dataUrlToBlob(dataUrl);
-        if (!blob) {
+        const uploadable = blob
+            ? (typeof File === "function"
+                ? new File([blob], fileName, { type: "image/png" })
+                : Object.assign(blob, {
+                    name: fileName,
+                    fileName,
+                    filename: fileName,
+                    mimeType: "image/png",
+                    type: "image/png",
+                }))
+            : dataUrlToUploadObject(dataUrl, fileName);
+        if (!uploadable) {
             return Promise.reject(new Error("Invalid rendered quote image."));
         }
-
-        const uploadable = typeof File === "function"
-            ? new File([blob], fileName, { type: "image/png" })
-            : Object.assign(blob, {
-                name: fileName,
-                fileName,
-                filename: fileName,
-                mimeType: "image/png",
-                type: "image/png",
-            });
+        if (!blob) {
+            logDebug("Using URI upload object fallback", fileName);
+        }
 
         const draftType = getChannelMessageDraftType();
         const rankedCandidates = uploadCandidates.slice(0, 90);
