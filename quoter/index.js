@@ -1,5 +1,6 @@
 (() => {
     const MODULE_TAG = "KettuQuoter";
+    const BUILD_ID = "2026-02-15-r3";
 
     const DEFAULTS = {
         grayscale: true,
@@ -783,9 +784,11 @@ render().catch(error => {
         const top = uploadCandidates.slice(0, 5).map(candidate =>
             `${candidate.key}@${candidate.source}[${candidate.score}]`,
         );
+        const directLabels = directCandidates.map(candidate => candidate.label).slice(0, 6);
 
         lastUploadLookupDiagnostics = [
             `directCandidates=${directCandidates.length}`,
+            `directLabels=${directLabels.join("|") || "none"}`,
             `initializedHintedModules=${initializedWithHints}`,
             `requiredFactoryCandidates=${requiredCandidateCount}`,
             `uploadFns=${uploadCandidates.length}`,
@@ -1007,6 +1010,63 @@ render().catch(error => {
         }
     }
 
+    function getUploadManager() {
+        return safeFind(() => metro.findByProps("clearAll", "addFile"));
+    }
+
+    function getMessageActionsModule() {
+        return safeFind(() => metro.findByProps("sendMessage", "receiveMessage"))
+            ?? safeFind(() => metro.findByProps("sendMessage", "editMessage"))
+            ?? safeFind(() => metro.findByProps("sendMessage"));
+    }
+
+    function trySendDraftWithAttachment(channelId) {
+        const MessageActions = getMessageActionsModule();
+        if (!MessageActions || typeof MessageActions.sendMessage !== "function") {
+            return Promise.reject(new Error("sendMessage handler unavailable."));
+        }
+
+        const payload = {
+            content: "",
+            tts: false,
+            invalidEmojis: [],
+            validNonShortcutEmojis: [],
+        };
+
+        const attempts = [
+            () => MessageActions.sendMessage(channelId, payload, false, { nonce: Date.now().toString() }),
+            () => MessageActions.sendMessage(channelId, payload, true, { nonce: Date.now().toString() }),
+            () => MessageActions.sendMessage(channelId, payload),
+        ];
+
+        let lastError = null;
+        for (const attempt of attempts) {
+            try {
+                return Promise.resolve(attempt());
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        return Promise.reject(lastError instanceof Error ? lastError : new Error("Unable to dispatch sendMessage."));
+    }
+
+    function tryUploadViaUploadManager(uploadable, channel, channelId, draftType, fileName) {
+        const manager = getUploadManager();
+        if (!manager || typeof manager.addFile !== "function") {
+            return Promise.reject(new Error("UploadManager.addFile is unavailable."));
+        }
+
+        const candidate = createUploadCandidate(manager.addFile, manager, "addFile", "UploadManager");
+        return invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType, fileName).then(() => {
+            return waitMs(120).then(() => {
+                if (!hasUploadForFile(channelId, fileName, draftType)) {
+                    throw new Error("UploadManager did not create a file upload entry.");
+                }
+            }).then(() => trySendDraftWithAttachment(channelId));
+        });
+    }
+
     function sendGeneratedImage(message, dataUrl) {
         const uploadCandidates = buildUploadFunctionCandidates(true);
         if (!uploadCandidates.length) {
@@ -1052,12 +1112,30 @@ render().catch(error => {
                     logError(`Upload failed after ${rankedCandidates.length} candidates`, fallbackError);
                     const details = shortErrors.length ? ` last=${shortErrors.join(" | ")}` : "";
                     cachedUploadCandidates = null;
-                    reject(new Error(`${fallbackError.message}.${details} ${lastUploadLookupDiagnostics}`));
+                    tryUploadViaUploadManager(uploadable, channel, channelId, draftType, fileName).then(() => {
+                        logDebug("Upload fallback succeeded", "UploadManager.addFile + sendMessage");
+                        resolve();
+                    }).catch(uploadManagerError => {
+                        const managerMsg = uploadManagerError instanceof Error ? uploadManagerError.message : String(uploadManagerError);
+                        reject(new Error(`${fallbackError.message}.${details} uploadManager=${managerMsg} ${lastUploadLookupDiagnostics}`));
+                    });
                     return;
                 }
 
                 const candidate = rankedCandidates[index++];
                 invokeUploadCandidate(candidate, uploadable, channel, channelId, draftType, fileName).then(() => {
+                    const uploadEntryExists = hasUploadForFile(channelId, fileName, draftType);
+                    if (uploadEntryExists && !isLikelyPrimaryUploaderCandidate(candidate)) {
+                        trySendDraftWithAttachment(channelId).then(() => {
+                            logDebug("Upload candidate succeeded", `${candidate.key}@${candidate.source}[${candidate.score}] + sendMessage`);
+                            resolve();
+                        }).catch(error => {
+                            lastError = error;
+                            run();
+                        });
+                        return;
+                    }
+
                     logDebug("Upload candidate succeeded", `${candidate.key}@${candidate.source}[${candidate.score}]`);
                     resolve();
                 }).catch(error => {
@@ -1519,7 +1597,8 @@ render().catch(error => {
             try {
                 ensureDefaults();
                 patchMessageLongPressSheet();
-                toast("Quoter loaded.");
+                logDebug("Plugin loaded", `build=${BUILD_ID}`);
+                toast(`Quoter loaded (${BUILD_ID}).`);
             } catch (error) {
                 const msg = error instanceof Error ? error.message : String(error);
                 errorToast(`Quoter failed to load: ${msg}`);
