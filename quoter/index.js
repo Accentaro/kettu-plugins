@@ -22,9 +22,6 @@
     const { getAssetIDByName } = vendetta.ui.assets;
 
     const LazyActionSheet = metro.findByProps("openLazy", "hideActionSheet");
-    const UploadHandler = metro.findByProps("promptToUpload");
-    const ChannelStore = metro.findByProps("getChannel", "getDMFromUserId")
-        ?? (typeof metro.findByStoreName === "function" ? metro.findByStoreName("ChannelStore") : null);
     const UserStore = typeof metro.findByStoreName === "function"
         ? metro.findByStoreName("UserStore")
         : null;
@@ -367,26 +364,133 @@ render().catch(error => {
         storage.watermark = String(options.watermark ?? "");
     }
 
+    function safeFind(factory, fallback = null) {
+        try {
+            const value = factory?.();
+            return value ?? fallback;
+        } catch {
+            return fallback;
+        }
+    }
+
+    function getChannelModule() {
+        return safeFind(() => (typeof metro.findByStoreName === "function" ? metro.findByStoreName("ChannelStore") : null))
+            ?? safeFind(() => metro.findByProps("getChannel", "getDMFromUserId"))
+            ?? safeFind(() => metro.findByProps("getChannel"));
+    }
+
+    function getUploadModule() {
+        const candidates = [
+            safeFind(() => metro.findByProps("promptToUpload")),
+            safeFind(() => metro.findByProps("promptToUpload", "showUploadDialog")),
+            safeFind(() => metro.findByProps("showUploadDialog", "canUploadLongMessages")),
+            safeFind(() => metro.findByProps("showUploadDialog")),
+        ];
+
+        for (const candidate of candidates) {
+            if (!candidate || typeof candidate !== "object") continue;
+            if (typeof candidate.promptToUpload === "function") return candidate;
+            if (typeof candidate.showUploadDialog === "function") return candidate;
+        }
+
+        return null;
+    }
+
+    function dataUrlToBlob(dataUrl) {
+        if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) {
+            return null;
+        }
+
+        const commaIndex = dataUrl.indexOf(",");
+        if (commaIndex < 0) return null;
+
+        const meta = dataUrl.slice(5, commaIndex);
+        const body = dataUrl.slice(commaIndex + 1);
+        const isBase64 = meta.includes(";base64");
+        const mime = (meta.split(";")[0] || "image/png").trim() || "image/png";
+
+        try {
+            if (isBase64) {
+                if (typeof atob !== "function") return null;
+                const binary = atob(body);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                    bytes[i] = binary.charCodeAt(i);
+                }
+                return new Blob([bytes], { type: mime });
+            }
+
+            const text = decodeURIComponent(body);
+            return new Blob([text], { type: mime });
+        } catch {
+            return null;
+        }
+    }
+
+    function resolveChannel(channelId) {
+        const channelModule = getChannelModule();
+        if (!channelModule) return null;
+
+        const candidates = [
+            channelModule?.getChannel?.(channelId),
+            channelModule?.getDMFromUserId?.(channelId),
+        ];
+
+        for (const channel of candidates) {
+            if (channel && typeof channel === "object") return channel;
+        }
+
+        return null;
+    }
+
     function sendGeneratedImage(message, dataUrl) {
-        if (!UploadHandler || typeof UploadHandler.promptToUpload !== "function") {
+        const uploadModule = getUploadModule();
+        if (!uploadModule) {
             return Promise.reject(new Error("Upload handler unavailable on this build."));
         }
 
         const channelId = getMessageChannelId(message);
         if (!channelId) return Promise.reject(new Error("Unable to resolve message channel."));
 
-        if (typeof File !== "function") {
-            return Promise.reject(new Error("File constructor unavailable on this build."));
+        const channel = resolveChannel(channelId);
+        if (!channel) return Promise.reject(new Error("Unable to resolve channel object."));
+
+        const fileName = buildFileName(message);
+        const blob = dataUrlToBlob(dataUrl);
+        if (!blob) {
+            return Promise.reject(new Error("Invalid rendered quote image."));
         }
 
-        return fetch(dataUrl).then(response => {
-            if (!response.ok) throw new Error("Failed to build quote image payload.");
-            return response.blob();
-        }).then(blob => {
-            const channel = ChannelStore?.getChannel?.(channelId) ?? { id: channelId };
-            const file = new File([blob], buildFileName(message), { type: "image/png" });
-            UploadHandler.promptToUpload([file], channel, 0);
-        });
+        const uploadable = typeof File === "function"
+            ? new File([blob], fileName, { type: "image/png" })
+            : Object.assign(blob, {
+                name: fileName,
+                fileName,
+                filename: fileName,
+                mimeType: "image/png",
+                type: "image/png",
+            });
+
+        if (typeof uploadModule.promptToUpload === "function") {
+            return Promise.resolve(uploadModule.promptToUpload([uploadable], channel, 0));
+        }
+
+        if (typeof uploadModule.showUploadDialog === "function") {
+            try {
+                return Promise.resolve(uploadModule.showUploadDialog([uploadable], channel, 0));
+            } catch { }
+
+            try {
+                return Promise.resolve(uploadModule.showUploadDialog({
+                    channel,
+                    files: [uploadable],
+                    uploads: [uploadable],
+                    draftType: 0,
+                }));
+            } catch { }
+        }
+
+        return Promise.reject(new Error("Upload handler unavailable on this build."));
     }
 
     function QuotePreviewCard({ message, onStateChange }) {
@@ -650,7 +754,6 @@ render().catch(error => {
             }),
             confirmText: "Send",
             cancelText: "Cancel",
-            secondaryConfirmText: "Copy Link",
             onConfirm: () => {
                 if (!modalState.dataUrl) {
                     errorToast("Failed to send quote: Quote image is not ready yet.");
@@ -663,16 +766,6 @@ render().catch(error => {
                     const msg = error instanceof Error ? error.message : String(error);
                     errorToast(`Failed to send quote: ${msg}`);
                 });
-            },
-            onConfirmSecondary: () => {
-                try {
-                    if (!modalState.dataUrl) throw new Error("Quote image is not ready yet.");
-                    clipboard.setString(modalState.dataUrl);
-                    toast("Quote image data copied.");
-                } catch (error) {
-                    const msg = error instanceof Error ? error.message : String(error);
-                    errorToast(`Failed to copy quote image: ${msg}`);
-                }
             },
         });
     }
