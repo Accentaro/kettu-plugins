@@ -396,6 +396,23 @@ render().catch(error => {
         return null;
     }
 
+    function getClipboardModule() {
+        const candidates = [
+            clipboard,
+            safeFind(() => metro.findByProps("setImage", "setString")),
+            safeFind(() => metro.findByProps("setImage")),
+            safeFind(() => metro.findByProps("setImageData")),
+            safeFind(() => metro.findByProps("setImageBase64")),
+            safeFind(() => metro.findByProps("setString", "getString", "hasString")),
+        ];
+
+        for (const candidate of candidates) {
+            if (candidate && typeof candidate === "object") return candidate;
+        }
+
+        return null;
+    }
+
     function dataUrlToBlob(dataUrl) {
         if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) {
             return null;
@@ -441,6 +458,46 @@ render().catch(error => {
         }
 
         return null;
+    }
+
+    function copyQuoteImageToClipboard(dataUrl) {
+        if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) {
+            return {
+                ok: false,
+                reason: "Invalid rendered quote image.",
+            };
+        }
+
+        const clipboardModule = getClipboardModule();
+        if (!clipboardModule) {
+            return {
+                ok: false,
+                reason: "Clipboard module unavailable on this build.",
+            };
+        }
+
+        const commaIndex = dataUrl.indexOf(",");
+        const base64 = commaIndex > 0 ? dataUrl.slice(commaIndex + 1) : "";
+
+        const setters = [
+            value => clipboardModule?.setImage?.(value),
+            value => clipboardModule?.setImageData?.(value),
+            value => clipboardModule?.setImageBase64?.(value),
+            value => clipboardModule?.setImageURL?.(value),
+        ];
+
+        for (const setter of setters) {
+            try {
+                if (typeof setter !== "function") continue;
+                setter(base64 || dataUrl);
+                return { ok: true };
+            } catch { }
+        }
+
+        return {
+            ok: false,
+            reason: "Image clipboard APIs unavailable on this build.",
+        };
     }
 
     function sendGeneratedImage(message, dataUrl) {
@@ -760,11 +817,18 @@ render().catch(error => {
                     return;
                 }
 
+                const copied = copyQuoteImageToClipboard(modalState.dataUrl);
+                if (copied.ok) {
+                    toast("Quote copied. Paste it into chat.");
+                    return;
+                }
+
                 sendGeneratedImage(message, modalState.dataUrl).then(() => {
                     toast("Quote sent as image.");
                 }).catch(error => {
                     const msg = error instanceof Error ? error.message : String(error);
-                    errorToast(`Failed to send quote: ${msg}`);
+                    const reason = copied.reason ? `${copied.reason} ` : "";
+                    errorToast(`Failed to send quote: ${reason}${msg}`);
                 });
             },
         });
