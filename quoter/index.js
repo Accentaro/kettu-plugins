@@ -14,7 +14,6 @@
     const common = metro.common;
     const React = common.React;
     const ReactNative = common.ReactNative;
-    const clipboard = common.clipboard;
 
     const { findInReactTree } = vendetta.utils;
     const { showConfirmationAlert } = vendetta.ui.alerts;
@@ -396,21 +395,55 @@ render().catch(error => {
         return null;
     }
 
-    function getClipboardModule() {
-        const candidates = [
-            clipboard,
-            safeFind(() => metro.findByProps("setImage", "setString")),
-            safeFind(() => metro.findByProps("setImage")),
-            safeFind(() => metro.findByProps("setImageData")),
-            safeFind(() => metro.findByProps("setImageBase64")),
-            safeFind(() => metro.findByProps("setString", "getString", "hasString")),
-        ];
+    let cachedPromptToUpload = null;
 
-        for (const candidate of candidates) {
-            if (candidate && typeof candidate === "object") return candidate;
+    function functionContainsUploadSignature(fn) {
+        if (typeof fn !== "function") return false;
+        try {
+            return String(fn).includes("Unexpected mismatch between files and file metadata");
+        } catch {
+            return false;
+        }
+    }
+
+    function getUploadPromptToUpload() {
+        if (typeof cachedPromptToUpload === "function") return cachedPromptToUpload;
+
+        const uploadModule = getUploadModule();
+        if (uploadModule && typeof uploadModule.promptToUpload === "function") {
+            cachedPromptToUpload = uploadModule.promptToUpload;
+            return cachedPromptToUpload;
+        }
+
+        const directFunction = safeFind(() =>
+            metro.find(candidate => functionContainsUploadSignature(candidate)),
+        );
+        if (typeof directFunction === "function") {
+            cachedPromptToUpload = directFunction;
+            return cachedPromptToUpload;
+        }
+
+        const holder = safeFind(() =>
+            metro.find(candidate => {
+                if (!candidate || typeof candidate !== "object") return false;
+                return Object.values(candidate).some(functionContainsUploadSignature);
+            }),
+        );
+        if (holder && typeof holder === "object") {
+            const fn = Object.values(holder).find(functionContainsUploadSignature);
+            if (typeof fn === "function") {
+                cachedPromptToUpload = fn;
+                return cachedPromptToUpload;
+            }
         }
 
         return null;
+    }
+
+    function getChannelMessageDraftType() {
+        const DraftType = safeFind(() => metro.findByProps("ChannelMessage", "SlashCommand"));
+        const value = DraftType?.ChannelMessage;
+        return Number.isFinite(value) ? value : 0;
     }
 
     function dataUrlToBlob(dataUrl) {
@@ -446,7 +479,7 @@ render().catch(error => {
 
     function resolveChannel(channelId) {
         const channelModule = getChannelModule();
-        if (!channelModule) return null;
+        if (!channelModule) return channelId ? { id: channelId } : null;
 
         const candidates = [
             channelModule?.getChannel?.(channelId),
@@ -460,49 +493,9 @@ render().catch(error => {
         return null;
     }
 
-    function copyQuoteImageToClipboard(dataUrl) {
-        if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) {
-            return {
-                ok: false,
-                reason: "Invalid rendered quote image.",
-            };
-        }
-
-        const clipboardModule = getClipboardModule();
-        if (!clipboardModule) {
-            return {
-                ok: false,
-                reason: "Clipboard module unavailable on this build.",
-            };
-        }
-
-        const commaIndex = dataUrl.indexOf(",");
-        const base64 = commaIndex > 0 ? dataUrl.slice(commaIndex + 1) : "";
-
-        const setters = [
-            value => clipboardModule?.setImage?.(value),
-            value => clipboardModule?.setImageData?.(value),
-            value => clipboardModule?.setImageBase64?.(value),
-            value => clipboardModule?.setImageURL?.(value),
-        ];
-
-        for (const setter of setters) {
-            try {
-                if (typeof setter !== "function") continue;
-                setter(base64 || dataUrl);
-                return { ok: true };
-            } catch { }
-        }
-
-        return {
-            ok: false,
-            reason: "Image clipboard APIs unavailable on this build.",
-        };
-    }
-
     function sendGeneratedImage(message, dataUrl) {
-        const uploadModule = getUploadModule();
-        if (!uploadModule) {
+        const promptToUpload = getUploadPromptToUpload();
+        if (typeof promptToUpload !== "function") {
             return Promise.reject(new Error("Upload handler unavailable on this build."));
         }
 
@@ -528,26 +521,8 @@ render().catch(error => {
                 type: "image/png",
             });
 
-        if (typeof uploadModule.promptToUpload === "function") {
-            return Promise.resolve(uploadModule.promptToUpload([uploadable], channel, 0));
-        }
-
-        if (typeof uploadModule.showUploadDialog === "function") {
-            try {
-                return Promise.resolve(uploadModule.showUploadDialog([uploadable], channel, 0));
-            } catch { }
-
-            try {
-                return Promise.resolve(uploadModule.showUploadDialog({
-                    channel,
-                    files: [uploadable],
-                    uploads: [uploadable],
-                    draftType: 0,
-                }));
-            } catch { }
-        }
-
-        return Promise.reject(new Error("Upload handler unavailable on this build."));
+        const draftType = getChannelMessageDraftType();
+        return Promise.resolve(promptToUpload([uploadable], channel, draftType));
     }
 
     function QuotePreviewCard({ message, onStateChange }) {
@@ -817,18 +792,11 @@ render().catch(error => {
                     return;
                 }
 
-                const copied = copyQuoteImageToClipboard(modalState.dataUrl);
-                if (copied.ok) {
-                    toast("Quote copied. Paste it into chat.");
-                    return;
-                }
-
                 sendGeneratedImage(message, modalState.dataUrl).then(() => {
                     toast("Quote sent as image.");
                 }).catch(error => {
                     const msg = error instanceof Error ? error.message : String(error);
-                    const reason = copied.reason ? `${copied.reason} ` : "";
-                    errorToast(`Failed to send quote: ${reason}${msg}`);
+                    errorToast(`Failed to send quote: ${msg}`);
                 });
             },
         });
