@@ -1025,16 +1025,30 @@ render().catch(error => {
         };
     }
 
-    function bytesToUploadable(bytes, mimeType, fileName) {
-        if (!bytes || !bytes.length) return null;
+    function makeUriUploadable(uri, mimeType, fileName) {
+        return {
+            uri,
+            name: fileName,
+            fileName,
+            filename: fileName,
+            mimeType: String(mimeType || "image/png"),
+            type: String(mimeType || "image/png"),
+        };
+    }
 
-        const mime = String(mimeType || "image/png");
+    function decorateBlobUploadable(blob, mimeType, fileName, fallbackUri) {
+        if (!blob) return fallbackUri ? makeUriUploadable(fallbackUri, mimeType, fileName) : null;
+        const mime = String(mimeType || blob.type || "image/png");
+
         if (typeof File === "function") {
-            return new File([bytes], fileName, { type: mime });
+            try {
+                return new File([blob], fileName, { type: mime });
+            } catch (error) {
+                logDebug("File constructor failed; falling back to blob object", String(error));
+            }
         }
 
-        if (typeof Blob === "function") {
-            const blob = new Blob([bytes], { type: mime });
+        try {
             return Object.assign(blob, {
                 name: fileName,
                 fileName,
@@ -1042,19 +1056,18 @@ render().catch(error => {
                 mimeType: mime,
                 type: mime,
             });
+        } catch (error) {
+            logDebug("Blob decoration failed; falling back to URI uploadable", String(error));
+            return fallbackUri ? makeUriUploadable(fallbackUri, mime, fileName) : null;
         }
+    }
 
+    function bytesToUploadable(bytes, mimeType, fileName) {
+        if (!bytes || !bytes.length) return null;
+        const mime = String(mimeType || "image/png");
         const base64 = encodeBytesToBase64(bytes);
         if (!base64) return null;
-
-        return {
-            uri: `data:${mime};base64,${base64}`,
-            name: fileName,
-            fileName,
-            filename: fileName,
-            mimeType: mime,
-            type: mime,
-        };
+        return makeUriUploadable(`data:${mime};base64,${base64}`, mime, fileName);
     }
 
     function dataUrlToUploadable(dataUrl, fileName) {
@@ -1090,21 +1103,12 @@ render().catch(error => {
                 return Promise.resolve(response.blob()).then(blob => {
                     if (!blob) return null;
                     const mime = blob.type || parsed.mime || "image/png";
-                    if (typeof File === "function") {
-                        return new File([blob], fileName, { type: mime });
-                    }
-                    return Object.assign(blob, {
-                        name: fileName,
-                        fileName,
-                        filename: fileName,
-                        mimeType: mime,
-                        type: mime,
-                    });
+                    return decorateBlobUploadable(blob, mime, fileName, parsed.normalized);
                 }).catch(() => null);
             }).catch(() => null);
         };
 
-        return tryFetch().then(uploadable => uploadable ?? tryDecode());
+        return tryFetch().then(uploadable => uploadable ?? tryDecode() ?? makeUriUploadable(parsed.normalized, parsed.mime, fileName));
     }
 
     function resolveChannel(channelId) {
