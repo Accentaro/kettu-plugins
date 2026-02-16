@@ -361,15 +361,6 @@ render().catch(error => {
         storage.watermark = String(options.watermark ?? "");
     }
 
-    function safeFind(factory, fallback = null) {
-        try {
-            const value = factory?.();
-            return value ?? fallback;
-        } catch {
-            return fallback;
-        }
-    }
-
     function parseDataUrl(dataUrl) {
         if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) return null;
         const commaIndex = dataUrl.indexOf(",");
@@ -391,12 +382,31 @@ render().catch(error => {
         return nmp.NativeFileModule || nmp.RTNFileManager || nmp.DCDFileManager || null;
     }
 
-    function getAuthToken() {
-        const tokenModule = safeFind(() => metro.findByProps("getToken"));
+    function getUploadModule() {
         try {
-            return tokenModule?.getToken?.() || null;
+            return metro.findByProps("clearAll", "addFile");
         } catch {
             return null;
+        }
+    }
+
+    function getMessageActions() {
+        try {
+            return metro.findByProps("sendMessage", "editMessage")
+                ?? metro.findByProps("sendMessage", "receiveMessage")
+                ?? metro.findByProps("sendMessage");
+        } catch {
+            return null;
+        }
+    }
+
+    function getDraftType() {
+        try {
+            const DraftType = metro.findByProps("ChannelMessage", "SlashCommand");
+            const value = DraftType?.ChannelMessage;
+            return Number.isFinite(value) ? value : 0;
+        } catch {
+            return 0;
         }
     }
 
@@ -409,33 +419,22 @@ render().catch(error => {
         } catch { }
     }
 
-    function sendImageViaRest(channelId, uri, fileName, mime) {
-        const token = getAuthToken();
-        if (!token) return Promise.reject(new Error("Auth token unavailable."));
+    function enqueueUpload(uploadModule, channelId, draftType, uploadable) {
+        const addFile = uploadModule?.addFile;
+        if (typeof addFile !== "function") throw new Error("Upload module unavailable.");
+        addFile(channelId, draftType, uploadable);
+    }
 
-        const formData = new FormData();
-        formData.append("files[0]", {
-            uri,
-            type: mime,
-            name: fileName,
-        });
-        formData.append("payload_json", JSON.stringify({
+    function invokeSendMessage(messageActions, channelId) {
+        const payload = {
             content: "",
-            attachments: [{ id: "0", filename: fileName }],
-        }));
-
-        return fetch(`https://discord.com/api/v9/channels/${channelId}/messages`, {
-            method: "POST",
-            headers: { Authorization: token },
-            body: formData,
-        }).then(response => {
-            if (!response.ok) {
-                return response.text().then(text => {
-                    throw new Error(`REST upload failed (${response.status}): ${text}`);
-                });
-            }
-            return true;
-        });
+            tts: false,
+            invalidEmojis: [],
+            validNonShortcutEmojis: [],
+        };
+        return Promise.resolve(
+            messageActions.sendMessage(channelId, payload, true, { nonce: Date.now().toString() }),
+        );
     }
 
     function sendGeneratedImage(message, dataUrl) {
@@ -450,7 +449,17 @@ render().catch(error => {
         const fileName = buildFileName(message);
         const mime = parsed.mime || "image/png";
         const fileModule = getNativeFileModule();
+        const uploadModule = getUploadModule();
+        const messageActions = getMessageActions();
+        const draftType = getDraftType();
+
         if (!fileModule) return Promise.reject(new Error("NativeFileModule unavailable."));
+        if (!uploadModule || typeof uploadModule.addFile !== "function") {
+            return Promise.reject(new Error("Upload module unavailable."));
+        }
+        if (!messageActions || typeof messageActions.sendMessage !== "function") {
+            return Promise.reject(new Error("sendMessage unavailable."));
+        }
 
         const tempPath = `kettu-quoter/${Date.now()}-${Math.random().toString(16).slice(2)}.png`;
 
@@ -459,7 +468,22 @@ render().catch(error => {
             if (!normalizedPath) throw new Error("Failed to write rendered image.");
 
             const uri = normalizedPath.startsWith("file://") ? normalizedPath : `file://${normalizedPath}`;
-            return sendImageViaRest(channelId, uri, fileName, mime);
+            const uploadable = {
+                uri,
+                type: mime,
+                name: fileName,
+                filename: fileName,
+                fileName,
+                mimeType: mime,
+            };
+
+            enqueueUpload(uploadModule, channelId, draftType, uploadable);
+
+            return new Promise((resolve, reject) => {
+                setTimeout(() => {
+                    invokeSendMessage(messageActions, channelId).then(resolve).catch(reject);
+                }, 260);
+            });
         }).finally(() => {
             setTimeout(() => cleanupTempFile(fileModule, tempPath), 15000);
         });
