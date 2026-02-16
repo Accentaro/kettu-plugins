@@ -497,16 +497,21 @@ render().catch(error => {
         return false;
     }
 
-    function waitForUploadEntry(channelId, fileName, draftType, timeoutMs = 1800) {
+    function waitForUploadEntry(channelId, fileName, draftType, beforeCount = 0, timeoutMs = 1800) {
         const started = Date.now();
         return new Promise((resolve, reject) => {
             const poll = () => {
-                if (hasUploadForFile(channelId, fileName, draftType)) {
+                const uploads = getUploadsForChannel(channelId, draftType);
+                const hasNamedEntry = hasUploadForFile(channelId, fileName, draftType);
+                const hasMoreEntries = uploads.length > beforeCount;
+                const hasAnyEntry = uploads.length > 0;
+
+                if (hasNamedEntry || hasMoreEntries || hasAnyEntry) {
                     resolve(true);
                     return;
                 }
                 if (Date.now() - started >= timeoutMs) {
-                    reject(new Error("No upload entry created."));
+                    resolve(false);
                     return;
                 }
                 setTimeout(poll, 120);
@@ -655,6 +660,7 @@ render().catch(error => {
                 fileName,
                 mimeType: mime,
             };
+            const beforeUploadCount = getUploadsForChannel(channelId, draftType).length;
 
             if (uploadHandler && typeof uploadHandler.promptToUpload === "function") {
                 invokePromptToUpload(uploadHandler, uploadable, channel, channelId, draftType);
@@ -662,7 +668,14 @@ render().catch(error => {
                 invokeUploadViaManager(uploadManager, uploadable, channel, channelId, draftType);
             }
 
-            return waitForUploadEntry(channelId, fileName, draftType).then(() => {
+            return waitForUploadEntry(channelId, fileName, draftType, beforeUploadCount).then(found => {
+                if (!found) {
+                    logDebug("Upload entry not observed; attempting sendMessage anyway", {
+                        channelId,
+                        draftType,
+                        fileName,
+                    });
+                }
                 return new Promise((resolve, reject) => {
                     setTimeout(() => {
                         try {
