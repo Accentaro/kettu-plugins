@@ -390,7 +390,20 @@ render().catch(error => {
         }
     }
 
+    function getUploadStore() {
+        try {
+            return (typeof metro.findByStoreName === "function"
+                ? metro.findByStoreName("UploadAttachmentStore")
+                : null)
+                ?? metro.findByProps("getUploads", "getUpload");
+        } catch {
+            return null;
+        }
+    }
+
     function getMessageActions() {
+        if (common?.messageUtil?.sendMessage) return common.messageUtil;
+
         try {
             return metro.findByProps("sendMessage", "editMessage")
                 ?? metro.findByProps("sendMessage", "receiveMessage")
@@ -422,7 +435,70 @@ render().catch(error => {
     function enqueueUpload(uploadModule, channelId, draftType, uploadable) {
         const addFile = uploadModule?.addFile;
         if (typeof addFile !== "function") throw new Error("Upload module unavailable.");
-        addFile(channelId, draftType, uploadable);
+
+        const attempts = [
+            () => addFile(channelId, draftType, uploadable),
+            () => addFile(channelId, uploadable, draftType),
+            () => addFile(channelId, uploadable),
+            () => addFile({ channelId, draftType, file: uploadable }),
+            () => addFile({ channelId, draftType, files: [uploadable] }),
+        ];
+
+        let lastError = null;
+        for (const attempt of attempts) {
+            try {
+                attempt();
+                return;
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        throw (lastError instanceof Error ? lastError : new Error("addFile failed."));
+    }
+
+    function getUploads(uploadStore, channelId, draftType) {
+        if (!uploadStore || typeof uploadStore.getUploads !== "function") return [];
+
+        try {
+            const uploads = uploadStore.getUploads(channelId, draftType);
+            return Array.isArray(uploads) ? uploads : [];
+        } catch {
+            try {
+                const uploads = uploadStore.getUploads(channelId);
+                return Array.isArray(uploads) ? uploads : [];
+            } catch {
+                return [];
+            }
+        }
+    }
+
+    function waitForUploadEntry(uploadStore, channelId, fileName, draftType) {
+        const started = Date.now();
+        return new Promise(resolve => {
+            const poll = () => {
+                const uploads = getUploads(uploadStore, channelId, draftType);
+                const hasEntry = uploads.some(upload => {
+                    if (!upload || typeof upload !== "object") return false;
+                    if (upload.filename === fileName || upload.name === fileName) return true;
+                    const item = upload.item;
+                    if (!item || typeof item !== "object") return false;
+                    return item.fileName === fileName
+                        || item.filename === fileName
+                        || item.name === fileName
+                        || String(item.uri || "").endsWith(`/${fileName}`);
+                });
+
+                if (hasEntry || Date.now() - started >= 2200) {
+                    resolve(hasEntry);
+                    return;
+                }
+
+                setTimeout(poll, 120);
+            };
+
+            setTimeout(poll, 120);
+        });
     }
 
     function invokeSendMessage(messageActions, channelId) {
@@ -432,9 +508,13 @@ render().catch(error => {
             invalidEmojis: [],
             validNonShortcutEmojis: [],
         };
-        return Promise.resolve(
-            messageActions.sendMessage(channelId, payload, true, { nonce: Date.now().toString() }),
-        );
+        const nonce = Date.now().toString();
+
+        try {
+            return Promise.resolve(messageActions.sendMessage(channelId, payload, void 0, { nonce }));
+        } catch {
+            return Promise.resolve(messageActions.sendMessage(channelId, payload));
+        }
     }
 
     function sendGeneratedImage(message, dataUrl) {
@@ -450,6 +530,7 @@ render().catch(error => {
         const mime = parsed.mime || "image/png";
         const fileModule = getNativeFileModule();
         const uploadModule = getUploadModule();
+        const uploadStore = getUploadStore();
         const messageActions = getMessageActions();
         const draftType = getDraftType();
 
@@ -479,10 +560,14 @@ render().catch(error => {
 
             enqueueUpload(uploadModule, channelId, draftType, uploadable);
 
-            return new Promise((resolve, reject) => {
-                setTimeout(() => {
-                    invokeSendMessage(messageActions, channelId).then(resolve).catch(reject);
-                }, 260);
+            return waitForUploadEntry(uploadStore, channelId, fileName, draftType).then(queued => {
+                if (!queued) throw new Error("Upload queue entry not observed.");
+
+                return new Promise((resolve, reject) => {
+                    setTimeout(() => {
+                        invokeSendMessage(messageActions, channelId).then(resolve).catch(reject);
+                    }, 180);
+                });
             });
         }).finally(() => {
             setTimeout(() => cleanupTempFile(fileModule, tempPath), 15000);
