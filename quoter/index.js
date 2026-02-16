@@ -558,6 +558,15 @@ render().catch(error => {
             ?? safeFind(() => metro.findByProps("sendMessage"));
     }
 
+    function getAuthToken() {
+        const tokenModule = safeFind(() => metro.findByProps("getToken"));
+        try {
+            return tokenModule?.getToken?.() || null;
+        } catch {
+            return null;
+        }
+    }
+
     function cleanupTempFile(fileModule, tempPath) {
         try {
             const maybePromise = fileModule?.removeFile?.("cache", tempPath);
@@ -710,17 +719,56 @@ render().catch(error => {
             () => messageActions.sendMessage(channelId, payload),
         ];
 
-        let lastError = null;
-        for (const attempt of attempts) {
-            try {
-                attempt();
-                return;
-            } catch (error) {
-                lastError = error;
+        let index = 0;
+        const run = lastError => {
+            if (index >= attempts.length) {
+                throw (lastError instanceof Error ? lastError : new Error("sendMessage failed."));
             }
-        }
 
-        throw (lastError instanceof Error ? lastError : new Error("sendMessage failed."));
+            const attempt = attempts[index++];
+            try {
+                const result = attempt();
+                return Promise.resolve(result).then(value => {
+                    if (value && typeof value === "object" && value.ok === false) {
+                        throw new Error("sendMessage returned ok=false.");
+                    }
+                    return value;
+                }).catch(error => run(error));
+            } catch (error) {
+                return run(error);
+            }
+        };
+
+        return run(null);
+    }
+
+    function sendImageViaRest(channelId, uri, fileName, mime) {
+        const token = getAuthToken();
+        if (!token) return Promise.reject(new Error("Auth token unavailable for REST fallback."));
+
+        const formData = new FormData();
+        formData.append("files[0]", {
+            uri,
+            type: mime,
+            name: fileName,
+        });
+        formData.append("payload_json", JSON.stringify({
+            content: "",
+            attachments: [{ id: "0", filename: fileName }],
+        }));
+
+        return fetch(`https://discord.com/api/v9/channels/${channelId}/messages`, {
+            method: "POST",
+            headers: { Authorization: token },
+            body: formData,
+        }).then(response => {
+            if (!response.ok) {
+                return response.text().then(text => {
+                    throw new Error(`REST upload failed (${response.status}): ${text}`);
+                });
+            }
+            return true;
+        });
     }
 
     function sendGeneratedImage(message, dataUrl) {
@@ -766,15 +814,17 @@ render().catch(error => {
                 mimeType: mime,
             };
             return enqueueUpload(uploadHandler, uploadManager, instantUploader, uploadable, channel, channelId, draftType, fileName).then(found => {
-                if (!found) logDebug("Upload entry not observed; attempting sendMessage anyway", { channelId, draftType, fileName });
+                if (!found) {
+                    logDebug("Upload entry not observed; using REST fallback", { channelId, draftType, fileName });
+                    return sendImageViaRest(channelId, uri, fileName, mime);
+                }
+
                 return new Promise((resolve, reject) => {
                     setTimeout(() => {
-                        try {
-                            invokeSendMessage(messageActions, channelId);
-                            resolve();
-                        } catch (error) {
-                            reject(error);
-                        }
+                        invokeSendMessage(messageActions, channelId).then(resolve).catch(error => {
+                            logDebug("sendMessage failed; trying REST fallback", String(error && error.message ? error.message : error));
+                            sendImageViaRest(channelId, uri, fileName, mime).then(resolve).catch(reject);
+                        });
                     }, 240);
                 });
             }).finally(() => {
