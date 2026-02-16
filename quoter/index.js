@@ -413,16 +413,6 @@ render().catch(error => {
         }
     }
 
-    function getDraftType() {
-        try {
-            const DraftType = metro.findByProps("ChannelMessage", "SlashCommand");
-            const value = DraftType?.ChannelMessage;
-            return Number.isFinite(value) ? value : 0;
-        } catch {
-            return 0;
-        }
-    }
-
     function cleanupTempFile(fileModule, tempPath) {
         try {
             const maybePromise = fileModule?.removeFile?.("cache", tempPath);
@@ -457,23 +447,42 @@ render().catch(error => {
         throw (lastError instanceof Error ? lastError : new Error("addFile failed."));
     }
 
-    function getUploads(uploadStore, channelId, draftType) {
+    function getUploads(uploadStore, channelId, draftType = 0) {
         if (!uploadStore || typeof uploadStore.getUploads !== "function") return [];
 
-        try {
-            const uploads = uploadStore.getUploads(channelId, draftType);
-            return Array.isArray(uploads) ? uploads : [];
-        } catch {
-            try {
-                const uploads = uploadStore.getUploads(channelId);
-                return Array.isArray(uploads) ? uploads : [];
-            } catch {
-                return [];
+        const collected = [];
+        const seen = new Set();
+        const pushUploads = uploads => {
+            if (!Array.isArray(uploads)) return;
+            for (const upload of uploads) {
+                if (!upload || seen.has(upload)) continue;
+                seen.add(upload);
+                collected.push(upload);
             }
-        }
+        };
+        const readByType = type => {
+            try {
+                pushUploads(uploadStore.getUploads(channelId, type));
+            } catch { }
+        };
+
+        readByType(draftType);
+        readByType(0);
+        readByType(1);
+        readByType(2);
+        readByType(3);
+        try {
+            pushUploads(uploadStore.getUploads(channelId));
+        } catch { }
+
+        return collected;
     }
 
-    function waitForUploadEntry(uploadStore, channelId, fileName, draftType) {
+    function waitForUploadEntry(uploadStore, channelId, fileName, draftType, beforeCount, tempName) {
+        if (!uploadStore || typeof uploadStore.getUploads !== "function") {
+            return Promise.resolve(false);
+        }
+
         const started = Date.now();
         return new Promise(resolve => {
             const poll = () => {
@@ -481,23 +490,28 @@ render().catch(error => {
                 const hasEntry = uploads.some(upload => {
                     if (!upload || typeof upload !== "object") return false;
                     if (upload.filename === fileName || upload.name === fileName) return true;
+
                     const item = upload.item;
                     if (!item || typeof item !== "object") return false;
+
+                    const uri = String(item.uri || "");
                     return item.fileName === fileName
                         || item.filename === fileName
                         || item.name === fileName
-                        || String(item.uri || "").endsWith(`/${fileName}`);
+                        || uri.includes(fileName)
+                        || (tempName && uri.includes(tempName));
                 });
+                const hasNewEntry = uploads.length > beforeCount;
 
-                if (hasEntry || Date.now() - started >= 2200) {
-                    resolve(hasEntry);
+                if (hasEntry || hasNewEntry || Date.now() - started >= 1800) {
+                    resolve(hasEntry || hasNewEntry);
                     return;
                 }
 
-                setTimeout(poll, 120);
+                setTimeout(poll, 100);
             };
 
-            setTimeout(poll, 120);
+            setTimeout(poll, 100);
         });
     }
 
@@ -510,11 +524,14 @@ render().catch(error => {
         };
         const nonce = Date.now().toString();
 
-        try {
-            return Promise.resolve(messageActions.sendMessage(channelId, payload, void 0, { nonce }));
-        } catch {
-            return Promise.resolve(messageActions.sendMessage(channelId, payload));
-        }
+        const send = args => Promise.resolve(messageActions.sendMessage(...args)).then(result => {
+            if (result && typeof result === "object" && result.ok === false) {
+                throw new Error("sendMessage returned ok=false.");
+            }
+            return result;
+        });
+
+        return send([channelId, payload, void 0, { nonce }]).catch(() => send([channelId, payload]));
     }
 
     function sendGeneratedImage(message, dataUrl) {
@@ -532,7 +549,7 @@ render().catch(error => {
         const uploadModule = getUploadModule();
         const uploadStore = getUploadStore();
         const messageActions = getMessageActions();
-        const draftType = getDraftType();
+        const draftType = 0;
 
         if (!fileModule) return Promise.reject(new Error("NativeFileModule unavailable."));
         if (!uploadModule || typeof uploadModule.addFile !== "function") {
@@ -543,6 +560,7 @@ render().catch(error => {
         }
 
         const tempPath = `kettu-quoter/${Date.now()}-${Math.random().toString(16).slice(2)}.png`;
+        const tempName = tempPath.split("/").pop() || "";
 
         return fileModule.writeFile("cache", tempPath, parsed.body, "base64").then(filePath => {
             const normalizedPath = String(filePath || "");
@@ -558,15 +576,14 @@ render().catch(error => {
                 mimeType: mime,
             };
 
+            const beforeCount = getUploads(uploadStore, channelId, draftType).length;
             enqueueUpload(uploadModule, channelId, draftType, uploadable);
 
-            return waitForUploadEntry(uploadStore, channelId, fileName, draftType).then(queued => {
-                if (!queued) throw new Error("Upload queue entry not observed.");
-
+            return waitForUploadEntry(uploadStore, channelId, fileName, draftType, beforeCount, tempName).then(queued => {
                 return new Promise((resolve, reject) => {
                     setTimeout(() => {
                         invokeSendMessage(messageActions, channelId).then(resolve).catch(reject);
-                    }, 180);
+                    }, queued ? 180 : 340);
                 });
             });
         }).finally(() => {
