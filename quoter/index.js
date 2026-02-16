@@ -458,6 +458,11 @@ render().catch(error => {
         return safeFind(() => metro.findByProps("clearAll", "addFile"));
     }
 
+    function getInstantBatchUploader() {
+        return safeFind(() => metro.find(m => m?.upload && typeof m?.instantBatchUpload === "function"))
+            ?? safeFind(() => metro.findByProps("instantBatchUpload"));
+    }
+
     function getUploadAttachmentStore() {
         return safeFind(() => (typeof metro.findByStoreName === "function" ? metro.findByStoreName("UploadAttachmentStore") : null))
             ?? safeFind(() => metro.findByProps("getUploads", "getUpload"));
@@ -481,8 +486,31 @@ render().catch(error => {
         return Array.isArray(uploads) ? uploads : [];
     }
 
+    function getUploadsForChannelAnyDraft(channelId, draftType = 0) {
+        const types = [draftType, 0, 1, 2, 3];
+        const merged = [];
+        const seen = new Set();
+        for (const t of types) {
+            for (const upload of getUploadsForChannel(channelId, t)) {
+                if (!upload || typeof upload !== "object") continue;
+                if (seen.has(upload)) continue;
+                seen.add(upload);
+                merged.push(upload);
+            }
+        }
+
+        for (const upload of getUploadsForChannel(channelId)) {
+            if (!upload || typeof upload !== "object") continue;
+            if (seen.has(upload)) continue;
+            seen.add(upload);
+            merged.push(upload);
+        }
+
+        return merged;
+    }
+
     function hasUploadForFile(channelId, fileName, draftType = 0) {
-        const uploads = getUploadsForChannel(channelId, draftType);
+        const uploads = getUploadsForChannelAnyDraft(channelId, draftType);
         for (const upload of uploads) {
             if (!upload || typeof upload !== "object") continue;
             if (upload.filename === fileName || upload.name === fileName) return true;
@@ -497,11 +525,15 @@ render().catch(error => {
         return false;
     }
 
+    function getUploadSnapshotCount(channelId, draftType = 0) {
+        return getUploadsForChannelAnyDraft(channelId, draftType).length;
+    }
+
     function waitForUploadEntry(channelId, fileName, draftType, beforeCount = 0, timeoutMs = 1800) {
         const started = Date.now();
         return new Promise((resolve, reject) => {
             const poll = () => {
-                const uploads = getUploadsForChannel(channelId, draftType);
+                const uploads = getUploadsForChannelAnyDraft(channelId, draftType);
                 const hasNamedEntry = hasUploadForFile(channelId, fileName, draftType);
                 const hasMoreEntries = uploads.length > beforeCount;
                 const hasAnyEntry = uploads.length > 0;
@@ -592,6 +624,77 @@ render().catch(error => {
         throw (lastError instanceof Error ? lastError : new Error("UploadManager.addFile failed."));
     }
 
+    function invokeInstantBatchUpload(instantModule, uploadable, channelId, draftType) {
+        const fn = instantModule?.instantBatchUpload;
+        if (typeof fn !== "function") throw new Error("instantBatchUpload unavailable.");
+
+        if (fn.length === 3) {
+            fn(channelId, [uploadable], false);
+            return;
+        }
+
+        fn({
+            channelId,
+            files: [uploadable],
+            draftType,
+            isThumbnail: false,
+            isClip: false,
+        });
+    }
+
+    function callAndCheckUpload(call, pathLabel, channelId, fileName, draftType, beforeCount) {
+        try {
+            call();
+        } catch (error) {
+            return Promise.reject(error);
+        }
+
+        return waitForUploadEntry(channelId, fileName, draftType, beforeCount, 420).then(found => {
+            if (found) {
+                logDebug("Upload enqueue succeeded", `${pathLabel}`);
+                return true;
+            }
+            return false;
+        });
+    }
+
+    function enqueueUpload(uploadHandler, uploadManager, instantModule, uploadable, channel, channelId, draftType, fileName) {
+        const beforeCount = getUploadSnapshotCount(channelId, draftType);
+        const attempts = [];
+
+        if (uploadHandler && typeof uploadHandler.promptToUpload === "function") {
+            attempts.push({ label: "prompt(channel,draft)", call: () => uploadHandler.promptToUpload([uploadable], channel, draftType) });
+            attempts.push({ label: "prompt(channel,0)", call: () => uploadHandler.promptToUpload([uploadable], channel, 0) });
+            attempts.push({ label: "prompt(channel)", call: () => uploadHandler.promptToUpload([uploadable], channel) });
+            attempts.push({ label: "prompt(channelId,draft)", call: () => uploadHandler.promptToUpload([uploadable], channelId, draftType) });
+            attempts.push({ label: "prompt(channelId,0)", call: () => uploadHandler.promptToUpload([uploadable], channelId, 0) });
+        }
+
+        if (uploadManager && typeof uploadManager.addFile === "function") {
+            attempts.push({ label: "addFile(channelId,draft,file)", call: () => uploadManager.addFile(channelId, draftType, uploadable) });
+            attempts.push({ label: "addFile(channelId,file,draft)", call: () => uploadManager.addFile(channelId, uploadable, draftType) });
+            attempts.push({ label: "addFile(channelId,file)", call: () => uploadManager.addFile(channelId, uploadable) });
+            attempts.push({ label: "addFile(channel,file,draft)", call: () => uploadManager.addFile(channel, uploadable, draftType) });
+            attempts.push({ label: "addFile(object:file)", call: () => uploadManager.addFile({ channelId, draftType, file: uploadable }) });
+            attempts.push({ label: "addFile(object:files)", call: () => uploadManager.addFile({ channelId, draftType, files: [uploadable] }) });
+        }
+
+        if (instantModule && typeof instantModule.instantBatchUpload === "function") {
+            attempts.push({ label: "instantBatchUpload", call: () => invokeInstantBatchUpload(instantModule, uploadable, channelId, draftType) });
+        }
+
+        let index = 0;
+        const run = () => {
+            if (index >= attempts.length) return Promise.resolve(false);
+            const attempt = attempts[index++];
+            return callAndCheckUpload(attempt.call, attempt.label, channelId, fileName, draftType, beforeCount)
+                .then(found => found ? true : run())
+                .catch(() => run());
+        };
+
+        return run();
+    }
+
     function invokeSendMessage(messageActions, channelId) {
         const payload = {
             content: "",
@@ -634,6 +737,7 @@ render().catch(error => {
         const fileModule = getNativeFileModule();
         const uploadHandler = getUploadHandler();
         const uploadManager = getUploadManager();
+        const instantUploader = getInstantBatchUploader();
         const messageActions = getMessageActions();
         const channel = resolveChannel(channelId);
         const draftType = getDraftType();
@@ -643,7 +747,8 @@ render().catch(error => {
             return Promise.reject(new Error("sendMessage unavailable."));
         }
         if ((!uploadHandler || typeof uploadHandler.promptToUpload !== "function")
-            && (!uploadManager || typeof uploadManager.addFile !== "function")) {
+            && (!uploadManager || typeof uploadManager.addFile !== "function")
+            && (!instantUploader || typeof instantUploader.instantBatchUpload !== "function")) {
             return Promise.reject(new Error("Upload handler unavailable."));
         }
 
@@ -660,22 +765,8 @@ render().catch(error => {
                 fileName,
                 mimeType: mime,
             };
-            const beforeUploadCount = getUploadsForChannel(channelId, draftType).length;
-
-            if (uploadHandler && typeof uploadHandler.promptToUpload === "function") {
-                invokePromptToUpload(uploadHandler, uploadable, channel, channelId, draftType);
-            } else {
-                invokeUploadViaManager(uploadManager, uploadable, channel, channelId, draftType);
-            }
-
-            return waitForUploadEntry(channelId, fileName, draftType, beforeUploadCount).then(found => {
-                if (!found) {
-                    logDebug("Upload entry not observed; attempting sendMessage anyway", {
-                        channelId,
-                        draftType,
-                        fileName,
-                    });
-                }
+            return enqueueUpload(uploadHandler, uploadManager, instantUploader, uploadable, channel, channelId, draftType, fileName).then(found => {
+                if (!found) logDebug("Upload entry not observed; attempting sendMessage anyway", { channelId, draftType, fileName });
                 return new Promise((resolve, reject) => {
                     setTimeout(() => {
                         try {
