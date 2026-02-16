@@ -434,9 +434,85 @@ render().catch(error => {
     }
 
     function getUploadHandler() {
-        return safeFind(() => metro.findByProps("promptToUpload"))
+        const direct = safeFind(() => metro.findByProps("promptToUpload"))
             ?? safeFind(() => metro.findByProps("showUploadFileSizeExceededError", "promptToUpload"))
             ?? safeFind(() => metro.findByProps("showUploadDialog", "promptToUpload"));
+        if (direct?.promptToUpload && typeof direct.promptToUpload === "function") return direct;
+
+        const all = safeFind(() => metro.findByPropsAll?.("promptToUpload"), []);
+        if (Array.isArray(all)) {
+            const match = all.find(m => typeof m?.promptToUpload === "function");
+            if (match) return match;
+        }
+
+        const named = safeFind(() => metro.findByName?.("promptToUpload", false));
+        if (typeof named === "function") return { promptToUpload: named };
+
+        const hinted = safeFind(() => metro.find?.(m => typeof m?.promptToUpload === "function"));
+        if (hinted?.promptToUpload && typeof hinted.promptToUpload === "function") return hinted;
+
+        return null;
+    }
+
+    function getUploadManager() {
+        return safeFind(() => metro.findByProps("clearAll", "addFile"));
+    }
+
+    function getUploadAttachmentStore() {
+        return safeFind(() => (typeof metro.findByStoreName === "function" ? metro.findByStoreName("UploadAttachmentStore") : null))
+            ?? safeFind(() => metro.findByProps("getUploads", "getUpload"));
+    }
+
+    function getUploadsForChannel(channelId, draftType = 0) {
+        const store = getUploadAttachmentStore();
+        if (!store || typeof store.getUploads !== "function") return [];
+
+        let uploads = [];
+        try {
+            uploads = store.getUploads(channelId, draftType);
+        } catch {
+            try {
+                uploads = store.getUploads(channelId);
+            } catch {
+                uploads = [];
+            }
+        }
+
+        return Array.isArray(uploads) ? uploads : [];
+    }
+
+    function hasUploadForFile(channelId, fileName, draftType = 0) {
+        const uploads = getUploadsForChannel(channelId, draftType);
+        for (const upload of uploads) {
+            if (!upload || typeof upload !== "object") continue;
+            if (upload.filename === fileName || upload.name === fileName) return true;
+
+            const item = upload.item;
+            if (item && typeof item === "object") {
+                if (item.fileName === fileName || item.filename === fileName || item.name === fileName) return true;
+                const uri = String(item.uri || "");
+                if (uri.endsWith(`/${fileName}`)) return true;
+            }
+        }
+        return false;
+    }
+
+    function waitForUploadEntry(channelId, fileName, draftType, timeoutMs = 1800) {
+        const started = Date.now();
+        return new Promise((resolve, reject) => {
+            const poll = () => {
+                if (hasUploadForFile(channelId, fileName, draftType)) {
+                    resolve(true);
+                    return;
+                }
+                if (Date.now() - started >= timeoutMs) {
+                    reject(new Error("No upload entry created."));
+                    return;
+                }
+                setTimeout(poll, 120);
+            };
+            setTimeout(poll, 120);
+        });
     }
 
     function getMessageActions() {
@@ -482,6 +558,35 @@ render().catch(error => {
         throw (lastError instanceof Error ? lastError : new Error("promptToUpload failed."));
     }
 
+    function invokeUploadViaManager(uploadManager, uploadable, channel, channelId, draftType) {
+        const fn = uploadManager?.addFile;
+        if (typeof fn !== "function") throw new Error("UploadManager.addFile unavailable.");
+
+        const attempts = [
+            () => fn(channelId, draftType, uploadable),
+            () => fn(channelId, uploadable, draftType),
+            () => fn(channelId, uploadable),
+            () => fn(channel, draftType, uploadable),
+            () => fn(channel, uploadable, draftType),
+            () => fn(channel, uploadable),
+            () => fn(uploadable, channelId, draftType),
+            () => fn({ channelId, draftType, file: uploadable }),
+            () => fn({ channel, channelId, draftType, file: uploadable }),
+        ];
+
+        let lastError = null;
+        for (const attempt of attempts) {
+            try {
+                attempt();
+                return;
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        throw (lastError instanceof Error ? lastError : new Error("UploadManager.addFile failed."));
+    }
+
     function invokeSendMessage(messageActions, channelId) {
         const payload = {
             content: "",
@@ -523,16 +628,18 @@ render().catch(error => {
         const mime = parsed.mime || "image/png";
         const fileModule = getNativeFileModule();
         const uploadHandler = getUploadHandler();
+        const uploadManager = getUploadManager();
         const messageActions = getMessageActions();
         const channel = resolveChannel(channelId);
         const draftType = getDraftType();
 
         if (!fileModule) return Promise.reject(new Error("NativeFileModule unavailable."));
-        if (!uploadHandler || typeof uploadHandler.promptToUpload !== "function") {
-            return Promise.reject(new Error("Upload handler unavailable."));
-        }
         if (!messageActions || typeof messageActions.sendMessage !== "function") {
             return Promise.reject(new Error("sendMessage unavailable."));
+        }
+        if ((!uploadHandler || typeof uploadHandler.promptToUpload !== "function")
+            && (!uploadManager || typeof uploadManager.addFile !== "function")) {
+            return Promise.reject(new Error("Upload handler unavailable."));
         }
 
         const tempPath = `kettu-quoter/${Date.now()}-${Math.random().toString(16).slice(2)}.png`;
@@ -549,17 +656,23 @@ render().catch(error => {
                 mimeType: mime,
             };
 
-            invokePromptToUpload(uploadHandler, uploadable, channel, channelId, draftType);
+            if (uploadHandler && typeof uploadHandler.promptToUpload === "function") {
+                invokePromptToUpload(uploadHandler, uploadable, channel, channelId, draftType);
+            } else {
+                invokeUploadViaManager(uploadManager, uploadable, channel, channelId, draftType);
+            }
 
-            return new Promise((resolve, reject) => {
-                setTimeout(() => {
-                    try {
-                        invokeSendMessage(messageActions, channelId);
-                        resolve();
-                    } catch (error) {
-                        reject(error);
-                    }
-                }, 260);
+            return waitForUploadEntry(channelId, fileName, draftType).then(() => {
+                return new Promise((resolve, reject) => {
+                    setTimeout(() => {
+                        try {
+                            invokeSendMessage(messageActions, channelId);
+                            resolve();
+                        } catch (error) {
+                            reject(error);
+                        }
+                    }, 240);
+                });
             }).finally(() => {
                 setTimeout(() => cleanupTempFile(fileModule, tempPath), 15000);
             });
