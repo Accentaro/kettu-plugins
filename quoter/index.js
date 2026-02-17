@@ -382,95 +382,12 @@ render().catch(error => {
         return nmp.NativeFileModule || nmp.RTNFileManager || nmp.DCDFileManager || null;
     }
 
-    function getUploadModule() {
-        try {
-            return metro.findByProps("clearAll", "addFile");
-        } catch {
-            return null;
-        }
-    }
-
-    function getPromptUploadModule() {
-        try {
-            return metro.findByProps("promptToUpload")
-                ?? metro.findByProps("showUploadFileSizeExceededError", "promptToUpload")
-                ?? metro.findByProps("showUploadDialog", "promptToUpload")
-                ?? metro.find(module => typeof module?.promptToUpload === "function");
-        } catch {
-            return null;
-        }
-    }
-
-    function getUploadStore() {
-        try {
-            return (typeof metro.findByStoreName === "function"
-                ? metro.findByStoreName("UploadAttachmentStore")
-                : null)
-                ?? metro.findByProps("getUploads", "getUpload");
-        } catch {
-            return null;
-        }
-    }
-
-    function getInstantBatchUploader() {
-        try {
-            return metro.find(module => module?.upload && typeof module?.instantBatchUpload === "function")
-                ?? metro.findByProps("instantBatchUpload");
-        } catch {
-            return null;
-        }
-    }
-
-    function getChannelStore() {
-        try {
-            return (typeof metro.findByStoreName === "function"
-                ? metro.findByStoreName("ChannelStore")
-                : null)
-                ?? metro.findByProps("getChannel", "getDMFromUserId")
-                ?? metro.findByProps("getChannel");
-        } catch {
-            return null;
-        }
-    }
-
-    function resolveChannel(channelId) {
-        const store = getChannelStore();
-        if (!store || typeof store.getChannel !== "function") return channelId;
-        try {
-            return store.getChannel(channelId) ?? channelId;
-        } catch {
-            return channelId;
-        }
-    }
-
-    function getDraftType() {
-        try {
-            const DraftType = metro.findByProps("ChannelMessage", "SlashCommand");
-            const value = DraftType?.ChannelMessage;
-            return Number.isFinite(value) ? value : 0;
-        } catch {
-            return 0;
-        }
-    }
-
     function getMessageActions() {
         if (common?.messageUtil?.sendMessage) return common.messageUtil;
-
         try {
             return metro.findByProps("sendMessage", "editMessage")
                 ?? metro.findByProps("sendMessage", "receiveMessage")
                 ?? metro.findByProps("sendMessage");
-        } catch {
-            return null;
-        }
-    }
-
-    function getMessageStore() {
-        try {
-            return (typeof metro.findByStoreName === "function"
-                ? metro.findByStoreName("MessageStore")
-                : null)
-                ?? metro.findByProps("getMessages", "getMessage");
         } catch {
             return null;
         }
@@ -485,288 +402,59 @@ render().catch(error => {
         } catch { }
     }
 
-    function invokeInstantBatchUpload(instantUploader, channelId, draftType, uploadable) {
-        const fn = instantUploader?.instantBatchUpload;
-        if (typeof fn !== "function") throw new Error("instantBatchUpload unavailable.");
-
-        if (fn.length === 3) {
-            fn(channelId, [uploadable], false);
-            return;
-        }
-
-        fn({
-            channelId,
-            draftType,
-            files: [uploadable],
-            isThumbnail: false,
-            isClip: false,
-        });
-    }
-
-    function getUploadAttempts(promptUploadModule, uploadModule, instantUploader, channel, channelId, draftType, uploadable) {
-        const promptToUpload = promptUploadModule?.promptToUpload;
-        const addFile = uploadModule?.addFile;
-        return [
-            ...(typeof promptToUpload === "function" ? [
-                () => promptToUpload([uploadable], channel, draftType),
-                () => promptToUpload([uploadable], channel, 0),
-                () => promptToUpload([uploadable], channel),
-                () => promptToUpload([uploadable], channelId, draftType),
-                () => promptToUpload([uploadable], channelId, 0),
-                () => promptToUpload([uploadable], channelId),
-            ] : []),
-            ...(typeof addFile === "function" ? [
-                () => addFile(channelId, draftType, uploadable),
-                () => addFile(channelId, uploadable, draftType),
-                () => addFile(channelId, uploadable),
-                () => addFile(channel, draftType, uploadable),
-                () => addFile(channel, uploadable, draftType),
-                () => addFile(channel, uploadable),
-                () => addFile(uploadable, channelId, draftType),
-                () => addFile({ channelId, draftType, file: uploadable }),
-                () => addFile({ channel, channelId, draftType, file: uploadable }),
-                () => addFile({ channelId, draftType, files: [uploadable] }),
-            ] : []),
-            ...(typeof instantUploader?.instantBatchUpload === "function" ? [
-                () => invokeInstantBatchUpload(instantUploader, channelId, draftType, uploadable),
-            ] : []),
-        ];
-    }
-
-    function getUploads(uploadStore, channelId, draftType = 0) {
-        if (!uploadStore || typeof uploadStore.getUploads !== "function") return [];
-
-        const collected = [];
-        const seen = new Set();
-        const pushUploads = uploads => {
-            if (!Array.isArray(uploads)) return;
-            for (const upload of uploads) {
-                if (!upload || seen.has(upload)) continue;
-                seen.add(upload);
-                collected.push(upload);
-            }
-        };
-        const readByType = type => {
-            try {
-                pushUploads(uploadStore.getUploads(channelId, type));
-            } catch { }
-        };
-
-        readByType(draftType);
-        readByType(0);
-        readByType(1);
-        readByType(2);
-        readByType(3);
-        try {
-            pushUploads(uploadStore.getUploads(channelId));
-        } catch { }
-
-        return collected;
-    }
-
-    function waitForUploadEntry(uploadStore, channelId, fileName, draftType, beforeCount, tempName) {
-        if (!uploadStore || typeof uploadStore.getUploads !== "function") {
-            return Promise.resolve(false);
-        }
-
-        const started = Date.now();
-        return new Promise(resolve => {
-            const poll = () => {
-                const uploads = getUploads(uploadStore, channelId, draftType);
-                const hasEntry = uploads.some(upload => {
-                    if (!upload || typeof upload !== "object") return false;
-                    if (upload.filename === fileName || upload.name === fileName) return true;
-
-                    const item = upload.item;
-                    if (!item || typeof item !== "object") return false;
-
-                    const uri = String(item.uri || "");
-                    return item.fileName === fileName
-                        || item.filename === fileName
-                        || item.name === fileName
-                        || uri.includes(fileName)
-                        || (tempName && uri.includes(tempName));
-                });
-                const hasNewEntry = uploads.length > beforeCount;
-
-                if (hasEntry || hasNewEntry || Date.now() - started >= 1800) {
-                    resolve(hasEntry || hasNewEntry);
-                    return;
-                }
-
-                setTimeout(poll, 100);
-            };
-
-            setTimeout(poll, 100);
-        });
-    }
-
-    function getChannelMessages(messageStore, channelId) {
-        if (!messageStore || typeof messageStore.getMessages !== "function") return [];
-
-        let messages;
-        try {
-            messages = messageStore.getMessages(channelId);
-        } catch {
-            return [];
-        }
-
-        if (!messages) return [];
-        if (Array.isArray(messages)) return messages;
-        if (Array.isArray(messages._array)) return messages._array;
-
-        try {
-            if (typeof messages.toArray === "function") {
-                const arrayValue = messages.toArray();
-                if (Array.isArray(arrayValue)) return arrayValue;
-            }
-        } catch { }
-
-        try {
-            if (typeof messages.values === "function") return Array.from(messages.values());
-        } catch { }
-
-        return [];
-    }
-
-    function waitForMessageByNonce(messageStore, channelId, nonce, timeoutMs = 4500) {
-        if (!messageStore || typeof messageStore.getMessages !== "function") {
-            return Promise.resolve(null);
-        }
-
-        const started = Date.now();
-        return new Promise(resolve => {
-            const poll = () => {
-                const found = getChannelMessages(messageStore, channelId).find(message =>
-                    String(message?.nonce ?? "") === nonce,
-                );
-
-                if (found || Date.now() - started >= timeoutMs) {
-                    resolve(found ?? null);
-                    return;
-                }
-
-                setTimeout(poll, 120);
-            };
-
-            setTimeout(poll, 120);
-        });
-    }
-
-    function invokeSendMessage(messageActions, messageStore, channelId) {
-        const payload = {
-            content: "",
-            tts: false,
-            invalidEmojis: [],
-            validNonShortcutEmojis: [],
-        };
-        const nonce = Date.now().toString();
-
-        const send = args => Promise.resolve(messageActions.sendMessage(...args)).then(result => {
-            if (result && typeof result === "object" && result.ok === false) {
-                throw new Error("sendMessage returned ok=false.");
-            }
-            return result;
-        });
-
-        return send([channelId, payload, void 0, { nonce }])
-            .catch(() => send([channelId, payload, false, { nonce }]))
-            .then(() => waitForMessageByNonce(messageStore, channelId, nonce))
-            .then(message => {
-                if (!message) throw new Error("Message dispatch was not observed.");
-                return message;
-            });
-    }
-
     function sendGeneratedImage(message, dataUrl) {
         const channelId = getMessageChannelId(message);
-        if (!channelId) return Promise.reject(new Error("Unable to resolve message channel."));
+        if (!channelId) return Promise.reject(new Error("Unable to resolve channel."));
 
         const parsed = parseDataUrl(dataUrl);
         if (!parsed || !parsed.isBase64 || !parsed.body) {
             return Promise.reject(new Error("Invalid rendered quote image."));
         }
 
-        const fileName = buildFileName(message);
-        const mime = parsed.mime || "image/png";
         const fileModule = getNativeFileModule();
-        const promptUploadModule = getPromptUploadModule();
-        const uploadModule = getUploadModule();
-        const instantUploader = getInstantBatchUploader();
-        const uploadStore = getUploadStore();
-        const messageActions = getMessageActions();
-        const messageStore = getMessageStore();
-        const draftType = getDraftType();
-
         if (!fileModule) return Promise.reject(new Error("NativeFileModule unavailable."));
-        if ((!promptUploadModule || typeof promptUploadModule.promptToUpload !== "function")
-            && (!uploadModule || typeof uploadModule.addFile !== "function")
-            && (!instantUploader || typeof instantUploader.instantBatchUpload !== "function")) {
-            return Promise.reject(new Error("Upload module unavailable."));
-        }
+
+        const messageActions = getMessageActions();
         if (!messageActions || typeof messageActions.sendMessage !== "function") {
             return Promise.reject(new Error("sendMessage unavailable."));
         }
 
+        const fileName = buildFileName(message);
         const tempPath = `kettu-quoter/${Date.now()}-${Math.random().toString(16).slice(2)}.png`;
-        const tempName = tempPath.split("/").pop() || "";
-        const channel = resolveChannel(channelId);
 
-        return fileModule.writeFile("cache", tempPath, parsed.body, "base64").then(filePath => {
-            const normalizedPath = String(filePath || "");
-            if (!normalizedPath) throw new Error("Failed to write rendered image.");
+        return fileModule.writeFile("cache", tempPath, parsed.body, "base64")
+            .then(filePath => {
+                const uri = (filePath || "").startsWith("file://") ? filePath : `file://${filePath}`;
 
-            const uri = normalizedPath.startsWith("file://") ? normalizedPath : `file://${normalizedPath}`;
-            const uploadable = {
-                uri,
-                type: mime,
-                name: fileName,
-                filename: fileName,
-                fileName,
-                mimeType: mime,
-            };
+                const form = new FormData();
+                form.append("reqtype", "fileupload");
+                form.append("time", "1h");
+                form.append("fileToUpload", { uri, type: "image/png", name: fileName });
 
-            const attempts = getUploadAttempts(
-                promptUploadModule,
-                uploadModule,
-                instantUploader,
-                channel,
-                channelId,
-                draftType,
-                uploadable,
-            );
-            if (!attempts.length) throw new Error("Upload module unavailable.");
-
-            let index = 0;
-            let lastError = null;
-
-            const run = () => {
-                if (index >= attempts.length) {
-                    throw (lastError instanceof Error ? lastError : new Error("Failed to enqueue upload."));
-                }
-
-                const attempt = attempts[index++];
-                const beforeCount = getUploads(uploadStore, channelId, draftType).length;
-
-                return Promise.resolve().then(() => {
-                    attempt();
-                    return waitForUploadEntry(uploadStore, channelId, fileName, draftType, beforeCount, tempName);
-                }).then(queued => {
-                    return new Promise((resolve, reject) => {
-                        setTimeout(() => {
-                            invokeSendMessage(messageActions, messageStore, channelId).then(resolve).catch(reject);
-                        }, queued ? 220 : 360);
-                    });
-                }).catch(error => {
-                    lastError = error;
-                    return run();
+                return fetch("https://litterbox.catbox.moe/resources/internals/api.php", {
+                    method: "POST",
+                    body: form,
                 });
-            };
+            })
+            .then(response => {
+                if (!response.ok) throw new Error("Image host returned " + response.status);
+                return response.text();
+            })
+            .then(imageUrl => {
+                const url = (imageUrl || "").trim();
+                if (!url.startsWith("http")) throw new Error("Image upload failed.");
 
-            return run();
-        }).finally(() => {
-            setTimeout(() => cleanupTempFile(fileModule, tempPath), 15000);
-        });
+                const nonce = Date.now().toString();
+                return messageActions.sendMessage(
+                    channelId,
+                    { content: url },
+                    void 0,
+                    { nonce }
+                );
+            })
+            .finally(() => {
+                cleanupTempFile(fileModule, tempPath);
+            });
     }
 
     // --- UI Components ---
