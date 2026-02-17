@@ -428,10 +428,9 @@ render().catch(error => {
 
                 const form = new FormData();
                 form.append("reqtype", "fileupload");
-                form.append("time", "1h");
                 form.append("fileToUpload", { uri, type: "image/png", name: fileName });
 
-                return fetch("https://litterbox.catbox.moe/resources/internals/api.php", {
+                return fetch("https://catbox.moe/user/api.php", {
                     method: "POST",
                     body: form,
                 });
